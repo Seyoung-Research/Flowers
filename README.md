@@ -1,4 +1,4 @@
-# flowers — A FlowJo Alternative in Rust
+# Flowers — A FlowJo Alternative in Rust
 
 [![Rust](https://img.shields.io/badge/rust-1.99+-orange.svg)](https://rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
