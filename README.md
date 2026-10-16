@@ -41,7 +41,7 @@ See `docs/USER_GUIDE.md` for a complete guide to using the GUI and all of its fe
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/flowers.git
+git clone https://github.com/Seyoung-Research/flowers.git
 cd flowers
 cargo build --release
 ```
