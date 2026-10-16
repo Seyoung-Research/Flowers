@@ -33,6 +33,11 @@
 
 See `docs/USER_GUIDE.md` for a complete guide to using the GUI and all of its features.
 
+## Known Issues:
+
+- Bilinear Gate is does not work.
+- Layout Editor's "Add current plot" button only selects the plots shown on the main window
+
 ## Installation
 
 ```bash
