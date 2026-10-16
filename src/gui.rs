@@ -14,14 +14,17 @@
 //! * detachable window that shows only a gated population
 //! * dots vs. topographic (contour) view
 //! * gates applied across all loaded FCS files
+//! * per-file "apply existing gates?" prompt when a new file is loaded
+//! * default X/Y axes picked as FSC-H / SSC-H when present
 //! * hierarchical gate tree with counts and percentages
 //! * CSV export of counts / percentages
 //! * quadrant gate (draw or click)
-//! * bilinear gate
+//! * bilinear / line gate (the region under a drawn line)
 //! * dark / light theme switch
 //! * detached population window with the full plotting & gating toolkit
 //! * interactive gate manipulation (move / rotate / enlarge / shrink)
 //! * free-form visual layout editor (drag, resize, reorder, preview)
+//! * editable axis labels in the layout editor (text, size, rotation, font, colour)
 //! * figure export to SVG, PNG, JPEG and TIFF
 
 use eframe::egui;
@@ -30,7 +33,7 @@ use egui_plot::{Bar, BarChart, Line, Plot, PlotBounds, Points, Polygon};
 use crate::export::{write_populations_csv, PopulationRow};
 use crate::fcs::{FcsFile, FcsParser};
 use crate::gating::{
-    BilinearGate, EllipseGate, Gate as GatingGate, Quadrant, QuadrantGate, RectangularGate,
+    EllipseGate, Gate as GatingGate, LineGate, Quadrant, QuadrantGate, RectangularGate,
 };
 use crate::layout::{
     render_layout_free, LayoutOptions, LayoutPlacement,
@@ -39,6 +42,9 @@ use crate::plot::{
     density_grid, density_rgb, dot_plot_svg, point_densities, AxisScale, PlotOverlay, PlotStyle,
 };
 use crate::raster::{save_svg_as_image, ImageFormat};
+use crate::project::{
+    GateShape, Project, ProjectGate, ProjectLabel, ProjectPanel, ProjectSample, ViewSettings,
+};
 
 // ---------------------------------------------------------------------------
 // Gate model
@@ -76,8 +82,6 @@ enum HandleId {
     Vertex(usize),
     /// Centre handle (move a split point / bilinear centre).
     Center,
-    /// Bilinear line-end handle (0..4).
-    End(usize),
 }
 
 /// A manipulation target chosen when a drag begins on a selected gate.
@@ -116,15 +120,15 @@ enum GateKind {
         y: f64,
         quad: Quadrant,
     },
-    /// One wedge of a 4-way bilinear (crossing lines) split.
+    /// A line gate: events on one side of a drawn line segment, restricted to
+    /// the segment's horizontal extent (the "region under the line").
     Bilinear {
-        cx: f64,
-        cy: f64,
-        angle1: f64,
-        angle2: f64,
-        radius: f64,
-        side1: bool,
-        side2: bool,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        /// When true, points below the line are selected; false selects above.
+        below: bool,
     },
 }
 
@@ -185,23 +189,19 @@ impl GateKind {
                 Box::new(QuadrantGate::new(x_idx, y_idx, *x as f32, *y as f32, quad.clone()))
             }
             GateKind::Bilinear {
-                cx,
-                cy,
-                angle1,
-                angle2,
-                radius,
-                side1,
-                side2,
-            } => Box::new(BilinearGate::new(
+                x1,
+                y1,
+                x2,
+                y2,
+                below,
+            } => Box::new(LineGate::new(
                 x_idx,
                 y_idx,
-                *cx as f32,
-                *cy as f32,
-                *angle1 as f32,
-                *angle2 as f32,
-                *radius as f32,
-                *side1,
-                *side2,
+                *x1 as f32,
+                *y1 as f32,
+                *x2 as f32,
+                *y2 as f32,
+                *below,
             )),
         }
     }
@@ -282,24 +282,23 @@ impl GateKind {
                 p
             }
             GateKind::Bilinear {
-                cx,
-                cy,
-                angle1,
-                angle2,
-                side1,
-                side2,
-                ..
+                x1: lx1,
+                y1: ly1,
+                x2: lx2,
+                y2: ly2,
+                below,
             } => {
-                let rect = vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
-                let p1 = clip_halfplane(&rect, line_coeffs(*cx, *cy, *angle1), *side1);
-                let p2 = clip_halfplane(&p1, line_coeffs(*cx, *cy, *angle2), *side2);
-                if p2.len() >= 3 {
-                    let mut closed = p2;
-                    closed.push(closed[0]);
-                    closed
-                } else {
-                    Vec::new()
-                }
+                let (xa, xb) = effective_x_band(*lx1, *lx2, x0, x1);
+                let ya = line_y_at(*lx1, *ly1, *lx2, *ly2, xa).clamp(y0, y1);
+                let yb = line_y_at(*lx1, *ly1, *lx2, *ly2, xb).clamp(y0, y1);
+                let y_edge = if *below { y0 } else { y1 };
+                vec![
+                    [xa, ya],
+                    [xb, yb],
+                    [xb, y_edge],
+                    [xa, y_edge],
+                    [xa, ya],
+                ]
             }
         }
     }
@@ -314,20 +313,13 @@ impl GateKind {
                 vec![[x0, *y], [x1, *y]],
             ],
             GateKind::Bilinear {
-                cx,
-                cy,
-                angle1,
-                angle2,
-                radius,
+                x1: lx1,
+                y1: ly1,
+                x2: lx2,
+                y2: ly2,
                 ..
             } => {
-                let line = |angle: f64| {
-                    vec![
-                        [cx - radius * angle.cos(), cy - radius * angle.sin()],
-                        [cx + radius * angle.cos(), cy + radius * angle.sin()],
-                    ]
-                };
-                vec![line(*angle1), line(*angle2)]
+                vec![vec![[*lx1, *ly1], [*lx2, *ly2]]]
             }
             _ => Vec::new(),
         }
@@ -362,9 +354,16 @@ impl GateKind {
             GateKind::Quadrant { x, y, quad } => {
                 format!("quadrant {quad:?} split x={x:.2} y={y:.2}")
             }
-            GateKind::Bilinear { cx, cy, .. } => {
-                format!("bilinear centre ({cx:.2},{cy:.2})")
-            }
+            GateKind::Bilinear {
+                x1,
+                y1,
+                x2,
+                y2,
+                below,
+            } => format!(
+                "line ({x1:.2},{y1:.2})-({x2:.2},{y2:.2}) {}",
+                if *below { "below" } else { "above" }
+            ),
         }
     }
 
@@ -386,7 +385,7 @@ impl GateKind {
                 ..
             } => [(x_min + x_max) / 2.0, (y_min + y_max) / 2.0],
             GateKind::Quadrant { x, y, .. } => [*x, *y],
-            GateKind::Bilinear { cx, cy, .. } => [*cx, *cy],
+            GateKind::Bilinear { x1, y1, x2, y2, .. } => [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
             GateKind::Polygon { vertices, .. } => centroid(vertices),
         }
     }
@@ -417,9 +416,11 @@ impl GateKind {
                 *x += dx;
                 *y += dy;
             }
-            GateKind::Bilinear { cx, cy, .. } => {
-                *cx += dx;
-                *cy += dy;
+            GateKind::Bilinear { x1, y1, x2, y2, .. } => {
+                *x1 += dx;
+                *x2 += dx;
+                *y1 += dy;
+                *y2 += dy;
             }
             GateKind::Polygon { vertices, .. } => {
                 for v in vertices {
@@ -437,10 +438,14 @@ impl GateKind {
             // Quadrants are defined by axis-aligned splits; rotation does not apply.
             GateKind::Quadrant { .. } => {}
             GateKind::Bilinear {
-                angle1, angle2, ..
+                x1, y1, x2, y2, ..
             } => {
-                *angle1 += delta;
-                *angle2 += delta;
+                let p1 = rotate_point([*x1, *y1], center, delta);
+                let p2 = rotate_point([*x2, *y2], center, delta);
+                *x1 = p1[0];
+                *y1 = p1[1];
+                *x2 = p2[0];
+                *y2 = p2[1];
             }
             GateKind::Polygon { vertices, .. } => {
                 for v in vertices {
@@ -478,11 +483,12 @@ impl GateKind {
                 *y = center[1] + (*y - center[1]) * f;
             }
             GateKind::Bilinear {
-                cx, cy, radius, ..
+                x1, y1, x2, y2, ..
             } => {
-                *cx = center[0] + (*cx - center[0]) * f;
-                *cy = center[1] + (*cy - center[1]) * f;
-                *radius *= f;
+                *x1 = center[0] + (*x1 - center[0]) * f;
+                *y1 = center[1] + (*y1 - center[1]) * f;
+                *x2 = center[0] + (*x2 - center[0]) * f;
+                *y2 = center[1] + (*y2 - center[1]) * f;
             }
             GateKind::Polygon { vertices, .. } => {
                 for v in vertices {
@@ -562,25 +568,11 @@ impl GateKind {
                 out.push(([c[0], max_y + span * 0.2], HandleId::Rotate));
                 out
             }
-            GateKind::Bilinear {
-                cx,
-                cy,
-                angle1,
-                angle2,
-                radius,
-                ..
-            } => {
-                let end = |a: f64, sgn: f64| {
-                    [cx + sgn * radius * a.cos(), cy + sgn * radius * a.sin()]
-                };
-                vec![
-                    ([*cx, *cy], HandleId::Center),
-                    (end(*angle1, -1.0), HandleId::End(0)),
-                    (end(*angle1, 1.0), HandleId::End(1)),
-                    (end(*angle2, -1.0), HandleId::End(2)),
-                    (end(*angle2, 1.0), HandleId::End(3)),
-                ]
-            }
+            GateKind::Bilinear { x1, y1, x2, y2, .. } => vec![
+                ([*x1, *y1], HandleId::Vertex(0)),
+                ([*x2, *y2], HandleId::Vertex(1)),
+                ([(x1 + x2) / 2.0, (y1 + y2) / 2.0], HandleId::Center),
+            ],
             GateKind::Quadrant { x, y, .. } => vec![([*x, *y], HandleId::Center)],
         }
     }
@@ -629,18 +621,15 @@ impl GateKind {
                 Quadrant::LowerLeft => x <= *sx && y <= *sy,
                 Quadrant::LowerRight => x >= *sx && y <= *sy,
             },
-            GateKind::Bilinear {
-                cx,
-                cy,
-                angle1,
-                angle2,
-                side1,
-                side2,
-                ..
-            } => {
-                let d1 = (x - cx) * angle1.sin() - (y - cy) * angle1.cos();
-                let d2 = (x - cx) * angle2.sin() - (y - cy) * angle2.cos();
-                (d1 >= 0.0) == *side1 && (d2 >= 0.0) == *side2
+            GateKind::Bilinear { x1, y1, x2, y2, .. } => {
+                // Treat a click near the line as a grab on the gate body.
+                let seg2 = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).max(1e-12);
+                let t = (((x - x1) * (x2 - x1) + (y - y1) * (y2 - y1)) / seg2)
+                    .clamp(0.0, 1.0);
+                let px = x1 + t * (x2 - x1);
+                let py = y1 + t * (y2 - y1);
+                let tol = (seg2.sqrt() * 0.04).max(1e-9);
+                ((x - px).powi(2) + (y - py).powi(2)).sqrt() <= tol
             }
             GateKind::Polygon { vertices, .. } => point_in_polygon([x, y], vertices),
         }
@@ -675,6 +664,61 @@ fn rotate_point(p: [f64; 2], center: [f64; 2], delta: f64) -> [f64; 2] {
     let dx = p[0] - center[0];
     let dy = p[1] - center[1];
     [center[0] + dx * c - dy * s, center[1] + dx * s + dy * c]
+}
+
+/// Paints a single line of text centred on `center` and rotated by `angle`
+/// radians clockwise. Used to preview the layout editor's axis-label styling.
+fn paint_label(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    family: egui::FontFamily,
+    angle: f32,
+) {
+    let font = egui::FontId::new(size.max(1.0), family);
+    let galley = painter.layout_no_wrap(text.to_string(), font, color);
+    let half = galley.size() / 2.0;
+    // Offset of the galley centre from its top-left, rotated about the top-left
+    // (which is the pivot egui rotates around).
+    let (s, c) = angle.sin_cos();
+    let off = egui::vec2(half.x * c - half.y * s, half.x * s + half.y * c);
+    let shape = egui::epaint::TextShape::new(center - off, galley, color).with_angle(angle);
+    painter.add(egui::Shape::Text(shape));
+}
+
+/// A single-line editor for a layout label's custom text. Blank means "use the
+/// parameter name".
+fn label_text_edit(ui: &mut egui::Ui, id: &str, style: &mut LabelStyle) {
+    let mut text = style.text.clone().unwrap_or_default();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .id_salt(id)
+                .hint_text("(parameter)")
+                .desired_width(110.0),
+        )
+        .changed()
+    {
+        style.text = if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        };
+    }
+}
+
+/// Font-family picker for a layout label.
+fn label_font_combo(ui: &mut egui::Ui, id: &str, font: &mut LabelFont) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(font.label())
+        .width(72.0)
+        .show_ui(ui, |ui| {
+            for f in LabelFont::ALL {
+                ui.selectable_value(font, f, f.label());
+            }
+        });
 }
 
 fn point_in_polygon(p: [f64; 2], verts: &[[f64; 2]]) -> bool {
@@ -767,34 +811,25 @@ fn apply_manipulation(
                 }
             }
         }
-        ManipTarget::Handle(HandleId::Vertex(i)) => {
-            if let GateKind::Polygon { vertices, .. } = &mut g {
+        ManipTarget::Handle(HandleId::Vertex(i)) => match &mut g {
+            GateKind::Polygon { vertices, .. } => {
                 if *i < vertices.len() {
                     vertices[*i] = cur;
                 }
             }
-        }
-        ManipTarget::Handle(HandleId::End(k)) => {
-            if let GateKind::Bilinear {
-                cx,
-                cy,
-                angle1,
-                angle2,
-                radius,
-                ..
-            } = &mut g
-            {
-                let line = *k / 2;
-                let ang = (cur[1] - *cy).atan2(cur[0] - *cx);
-                let r = ((cur[0] - *cx).powi(2) + (cur[1] - *cy).powi(2)).sqrt();
-                if line == 0 {
-                    *angle1 = ang;
-                } else {
-                    *angle2 = ang;
+            GateKind::Bilinear { x1, y1, x2, y2, .. } => match i {
+                0 => {
+                    *x1 = cur[0];
+                    *y1 = cur[1];
                 }
-                *radius = r.max(1e-6);
-            }
-        }
+                1 => {
+                    *x2 = cur[0];
+                    *y2 = cur[1];
+                }
+                _ => {}
+            },
+            _ => {}
+        },
     }
     g
 }
@@ -918,7 +953,7 @@ fn drive_interact(
 }
 
 /// A gate definition, shared across all loaded samples.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct GateDef {
     name: String,
     /// Parameter indices this gate was defined on.
@@ -942,22 +977,28 @@ impl GateDef {
 
 /// Computes the event indices for every gate, following the parent hierarchy.
 ///
-/// `sample_idx` is the index of the sample being computed for. Gates with
-/// `apply_to_all == false` are only evaluated for their owner sample; gates
-/// with an out-of-range parameter index simply yield an empty population.
+/// `sample_idx` is the index of the sample being computed for. `sample_apply_gates`
+/// is the per-sample switch set when the file was loaded (or toggled by the user);
+/// when it is false the shared gate set is skipped for that sample. A gate is
+/// evaluated for a sample when either the gate is marked "apply to all" *and* the
+/// sample has gating enabled, or the sample is the gate's owner. Gates with an
+/// out-of-range parameter index simply yield an empty population.
 fn compute_gate_populations(
     data: &ndarray::Array2<f32>,
     gates: &[GateDef],
     sample_idx: Option<usize>,
+    sample_apply_gates: bool,
 ) -> Vec<Vec<usize>> {
     let (total, n_params) = data.dim();
     let mut result: Vec<Vec<usize>> = vec![Vec::new(); gates.len()];
     for (i, gate) in gates.iter().enumerate() {
-        // Respect the per-gate "apply to all samples" flag.
-        if !gate.apply_to_all {
-            if gate.owner != sample_idx {
-                continue;
-            }
+        // A gate always applies to the sample it was created on. Otherwise it
+        // applies only when it is marked "apply to all" and the sample has
+        // gating enabled.
+        let owner = gate.owner == sample_idx;
+        let shared = gate.apply_to_all && sample_apply_gates;
+        if !owner && !shared {
+            continue;
         }
         if gate.x_idx >= n_params || gate.y_idx >= n_params {
             continue;
@@ -988,51 +1029,26 @@ fn children_map(gates: &[GateDef]) -> Vec<Vec<usize>> {
     children
 }
 
-/// Half-plane coefficients `(a, b, c)` such that `a*x + b*y + c >= 0` selects
-/// the positive side of the line through `(cx, cy)` with orientation `angle`.
-fn line_coeffs(cx: f64, cy: f64, angle: f64) -> (f64, f64, f64) {
-    let a = angle.sin();
-    let b = -angle.cos();
-    let c = cy * angle.cos() - cx * angle.sin();
-    (a, b, c)
-}
-
-/// Sutherland–Hodgman clip of a polygon by the half-plane `a*x + b*y + c >= 0`
-/// (or the opposite side when `positive` is false).
-fn clip_halfplane(poly: &[[f64; 2]], (a, b, c): (f64, f64, f64), positive: bool) -> Vec<[f64; 2]> {
-    let (a, b, c) = if positive { (a, b, c) } else { (-a, -b, -c) };
-    let dist = |p: [f64; 2]| a * p[0] + b * p[1] + c;
-    let mut out: Vec<[f64; 2]> = Vec::new();
-    if poly.is_empty() {
-        return out;
-    }
-    for i in 0..poly.len() {
-        let cur = poly[i];
-        let prev = poly[(i + poly.len() - 1) % poly.len()];
-        let d_cur = dist(cur);
-        let d_prev = dist(prev);
-        let cur_in = d_cur >= 0.0;
-        let prev_in = d_prev >= 0.0;
-        if cur_in {
-            if !prev_in {
-                out.push(intersect(prev, cur, d_prev, d_cur));
-            }
-            out.push(cur);
-        } else if prev_in {
-            out.push(intersect(prev, cur, d_prev, d_cur));
-        }
-    }
-    out
-}
-
-fn intersect(p0: [f64; 2], p1: [f64; 2], d0: f64, d1: f64) -> [f64; 2] {
-    let denom = d0 - d1;
-    let t = if denom.abs() < f64::EPSILON {
-        0.0
+/// The effective horizontal extent of a line gate. A (near-)vertical segment has
+/// no meaningful width, so it falls back to the full axis span; this keeps the
+/// gate non-empty and matches the renderer's fill.
+fn effective_x_band(x1: f64, x2: f64, x_range0: f64, x_range1: f64) -> (f64, f64) {
+    let (a, b) = if x1 <= x2 { (x1, x2) } else { (x2, x1) };
+    if (b - a).abs() < 1e-9 {
+        (x_range0.min(x_range1), x_range0.max(x_range1))
     } else {
-        (d0 / denom).clamp(0.0, 1.0)
-    };
-    [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t]
+        (a, b)
+    }
+}
+
+/// Y value of the line through `(x1, y1)..(x2, y2)` at `x`.
+fn line_y_at(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
+    let dx = x2 - x1;
+    if dx.abs() < 1e-9 {
+        (y1 + y2) / 2.0
+    } else {
+        y1 + (y2 - y1) * (x - x1) / dx
+    }
 }
 
 fn gate_color(i: usize) -> egui::Color32 {
@@ -1084,6 +1100,9 @@ struct PlotCfg {
     x_label: String,
     y_label: String,
     interactive: bool,
+    /// When true, the creation drag shows a line (for line/bilinear gates)
+    /// instead of a rectangle.
+    line_preview: bool,
 }
 
 /// Interaction state passed into / out of [`show_plot`].
@@ -1227,21 +1246,29 @@ fn show_plot(ui: &mut egui::Ui, id: &str, cfg: &PlotCfg, inter: &mut PlotInterac
         .show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(PlotBounds::from_min_max([bx0, by0], [bx1, by1]));
 
-            // Drag rectangle (created by the user while gating).
+            // Drag preview (created by the user while gating).
             if let (Some(a), Some(b)) = (inter.drag_start, inter.drag_current) {
                 let a = [tx(a[0]), ty(a[1])];
                 let b = [tx(b[0]), ty(b[1])];
-                plot_ui.polygon(
-                    Polygon::new(vec![
-                        [a[0], a[1]],
-                        [b[0], a[1]],
-                        [b[0], b[1]],
-                        [a[0], b[1]],
-                        [a[0], a[1]],
-                    ])
-                    .fill_color(egui::Color32::from_rgba_unmultiplied(0, 150, 255, 60))
-                    .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 120, 200))),
-                );
+                if cfg.line_preview {
+                    plot_ui.line(
+                        Line::new(vec![a, b])
+                            .color(egui::Color32::from_rgb(0, 120, 200))
+                            .width(2.0_f32),
+                    );
+                } else {
+                    plot_ui.polygon(
+                        Polygon::new(vec![
+                            [a[0], a[1]],
+                            [b[0], a[1]],
+                            [b[0], b[1]],
+                            [a[0], b[1]],
+                            [a[0], a[1]],
+                        ])
+                        .fill_color(egui::Color32::from_rgba_unmultiplied(0, 150, 255, 60))
+                        .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 120, 200))),
+                    );
+                }
             }
 
             // Gates.
@@ -1400,7 +1427,13 @@ fn show_plot(ui: &mut egui::Ui, id: &str, cfg: &PlotCfg, inter: &mut PlotInterac
 /// A loaded FCS sample.
 struct SampleEntry {
     id: String,
+    /// Full path to the source FCS file (used when saving a workspace).
+    path: std::path::PathBuf,
     fcs: FcsFile,
+    /// Whether the shared gate set is applied to this sample. Controlled from
+    /// the sample list and by the per-file prompt shown when a file is loaded
+    /// after gates already exist.
+    apply_gates: bool,
 }
 
 /// Which gate type new gates get when drawn.
@@ -1433,9 +1466,81 @@ impl NewGateType {
     ];
 }
 
+/// Font family choices for layout axis labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelFont {
+    Sans,
+    Serif,
+    Mono,
+}
+
+impl LabelFont {
+    const ALL: [LabelFont; 3] = [LabelFont::Sans, LabelFont::Serif, LabelFont::Mono];
+
+    fn label(self) -> &'static str {
+        match self {
+            LabelFont::Sans => "Sans",
+            LabelFont::Serif => "Serif",
+            LabelFont::Mono => "Mono",
+        }
+    }
+
+    /// CSS font-family used in SVG export.
+    fn css(self) -> &'static str {
+        match self {
+            LabelFont::Sans => "sans-serif",
+            LabelFont::Serif => "serif",
+            LabelFont::Mono => "monospace",
+        }
+    }
+
+    /// egui font family used for the live preview.
+    fn egui(self) -> egui::FontFamily {
+        match self {
+            LabelFont::Mono => egui::FontFamily::Monospace,
+            _ => egui::FontFamily::Proportional,
+        }
+    }
+}
+
+/// Styling for one axis label in the layout editor.
+#[derive(Debug, Clone, PartialEq)]
+struct LabelStyle {
+    /// Custom text; `None` uses the parameter name.
+    text: Option<String>,
+    /// Font size (SVG units).
+    size: f32,
+    /// Rotation, in degrees (clockwise).
+    rotation_deg: f32,
+    font: LabelFont,
+    color: egui::Color32,
+}
+
+impl LabelStyle {
+    fn x_default() -> Self {
+        Self {
+            text: None,
+            size: 11.0,
+            rotation_deg: 0.0,
+            font: LabelFont::Sans,
+            color: egui::Color32::from_gray(90),
+        }
+    }
+
+    fn y_default() -> Self {
+        Self {
+            text: None,
+            size: 11.0,
+            rotation_deg: -90.0,
+            font: LabelFont::Sans,
+            color: egui::Color32::from_gray(90),
+        }
+    }
+}
+
 /// One entry in the layout editor. Panels live on a free-form canvas and can be
 /// moved / resized with the mouse (Photoshop-style).
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct LayoutPanelSpec {
     sample: usize,
     x: usize,
@@ -1448,6 +1553,9 @@ struct LayoutPanelSpec {
     rect: egui::Rect,
     /// Normalised (0..1) preview points, cached when the panel is added.
     preview: Vec<[f32; 2]>,
+    /// Styling for the X and Y axis labels.
+    x_label: LabelStyle,
+    y_label: LabelStyle,
 }
 
 /// An in-progress canvas manipulation (move or resize) of a layout panel.
@@ -1516,6 +1624,51 @@ impl Theme {
     }
 }
 
+/// A snapshot of the editable application state for Undo / Redo.
+///
+/// Loaded samples (the FCS data) are deliberately excluded: they are inputs, not
+/// edits, so undoing never unloads a file. Everything a user can change about the
+/// gating, the view and the layout is captured here.
+#[derive(Clone, PartialEq)]
+struct UndoState {
+    gates: Vec<GateDef>,
+    selected_gate: Option<usize>,
+    x_param: Option<usize>,
+    y_param: Option<usize>,
+    view_mode: ViewMode,
+    x_scale: AxisScale,
+    y_scale: AxisScale,
+    point_color: egui::Color32,
+    gradient: bool,
+    contour_levels: usize,
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+    layout_panels: Vec<LayoutPanelSpec>,
+    layout_columns: usize,
+    layout_selected: Option<usize>,
+}
+
+impl UndoState {
+    /// Compares everything that counts as a *document* edit, ignoring the
+    /// transient selection fields so that merely selecting a gate or panel does
+    /// not create an undo step.
+    fn same_document(&self, other: &Self) -> bool {
+        self.gates == other.gates
+            && self.x_param == other.x_param
+            && self.y_param == other.y_param
+            && self.view_mode == other.view_mode
+            && self.x_scale == other.x_scale
+            && self.y_scale == other.y_scale
+            && self.point_color == other.point_color
+            && self.gradient == other.gradient
+            && self.contour_levels == other.contour_levels
+            && self.x_range == other.x_range
+            && self.y_range == other.y_range
+            && self.layout_panels == other.layout_panels
+            && self.layout_columns == other.layout_columns
+    }
+}
+
 /// The egui application state.
 pub struct FlowersApp {
     samples: Vec<SampleEntry>,
@@ -1565,6 +1718,18 @@ pub struct FlowersApp {
 
     name_edit: String,
     status: String,
+    /// Index of a newly loaded sample waiting for the "apply existing gates?"
+    /// prompt. `None` when no prompt is pending.
+    pending_apply_prompt: Option<usize>,
+
+    // Undo / redo.
+    /// Snapshots of [`UndoState`], oldest first. `history[history_idx]` is the
+    /// currently-applied state.
+    history: Vec<UndoState>,
+    history_idx: usize,
+    /// Set for one frame after an undo/redo so the state comparison at the end
+    /// of the frame does not push a redundant entry.
+    history_skip: bool,
 }
 
 impl Default for FlowersApp {
@@ -1601,6 +1766,10 @@ impl Default for FlowersApp {
             export_scale: 2.0,
             name_edit: String::new(),
             status: "Ready — load an FCS file".to_string(),
+            pending_apply_prompt: None,
+            history: Vec::new(),
+            history_idx: 0,
+            history_skip: false,
         }
     }
 }
@@ -1619,6 +1788,257 @@ fn param_display_name(fcs: &FcsFile, idx: usize) -> String {
             }
         })
         .unwrap_or_else(|| format!("P{idx}"))
+}
+
+/// Chooses sensible default X/Y parameters for a newly loaded file.
+///
+/// Prefers **FSC-H** and **SSC-H** (falling back to FSC-A/SSC-A, then any FSC/
+/// SSC channel), and otherwise uses the first two parameters. The two axes are
+/// guaranteed to differ when the file has at least two parameters.
+fn default_param_pair(fcs: &FcsFile) -> (usize, usize) {
+    let n = fcs.parameters.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let find = |want: &str| {
+        fcs.parameters.iter().position(|p| {
+            p.name.trim().eq_ignore_ascii_case(want)
+                || p.description.trim().eq_ignore_ascii_case(want)
+        })
+    };
+    let x = find("FSC-H")
+        .or_else(|| find("FSC-A"))
+        .or_else(|| find("FSC"))
+        .unwrap_or(0);
+    let y = find("SSC-H")
+        .or_else(|| find("SSC-A"))
+        .or_else(|| find("SSC"))
+        .unwrap_or(if n > 1 { 1 } else { 0 });
+    let y = if y == x && n > 1 { (x + 1) % n } else { y };
+    (x, y)
+}
+
+/// Compact, precise formatting for editable axis-range fields.
+///
+/// Flow-cytometry axes are often on the order of 10^7, where a plain decimal is
+/// hard to read and type. Large/small magnitudes are shown in scientific
+/// notation (e.g. `5.300871e6`) and mid-range values in plain notation.
+///
+/// Both branches use Rust's shortest round-tripping float formatting, so the
+/// displayed text parses back to exactly the same value — focusing a field and
+/// clicking away never nudges the number.
+fn format_edit_num(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let abs = v.abs();
+    if abs >= 1.0e5 || abs < 1.0e-2 {
+        format!("{v:e}")
+    } else {
+        format!("{v}")
+    }
+}
+
+/// A `DragValue` for editing one end of an axis range.
+///
+/// The drag speed scales with the axis `span`, so a 10^7-wide axis can be swept
+/// in a single drag instead of one unit per pixel, and the value is displayed in
+/// compact scientific notation. Typing works too (`1e7`, `5.3e6`, `250000`).
+fn range_drag_value(value: &mut f64, span: f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .speed((span.abs() / 500.0).max(1.0))
+        .custom_formatter(|n, _| format_edit_num(n))
+        .custom_parser(|s| s.trim().parse::<f64>().ok())
+}
+
+// -- workspace (de)serialisation helpers -----------------------------------
+
+fn view_mode_id(v: ViewMode) -> &'static str {
+    match v {
+        ViewMode::Dots => "dots",
+        ViewMode::Contour => "contour",
+        ViewMode::Histogram => "histogram",
+    }
+}
+
+fn view_mode_from_id(s: &str) -> ViewMode {
+    match s {
+        "contour" => ViewMode::Contour,
+        "histogram" => ViewMode::Histogram,
+        _ => ViewMode::Dots,
+    }
+}
+
+fn axis_scale_id(s: AxisScale) -> &'static str {
+    match s {
+        AxisScale::Linear => "linear",
+        AxisScale::Log => "log",
+    }
+}
+
+fn axis_scale_from_id(s: &str) -> AxisScale {
+    match s {
+        "log" => AxisScale::Log,
+        _ => AxisScale::Linear,
+    }
+}
+
+fn label_font_id(f: LabelFont) -> &'static str {
+    match f {
+        LabelFont::Sans => "sans",
+        LabelFont::Serif => "serif",
+        LabelFont::Mono => "mono",
+    }
+}
+
+fn label_font_from_id(s: &str) -> LabelFont {
+    match s {
+        "serif" => LabelFont::Serif,
+        "mono" => LabelFont::Mono,
+        _ => LabelFont::Sans,
+    }
+}
+
+fn quadrant_id(q: &Quadrant) -> &'static str {
+    match q {
+        Quadrant::UpperLeft => "upper_left",
+        Quadrant::UpperRight => "upper_right",
+        Quadrant::LowerLeft => "lower_left",
+        Quadrant::LowerRight => "lower_right",
+    }
+}
+
+fn quadrant_from_id(s: &str) -> Quadrant {
+    match s {
+        "upper_left" => Quadrant::UpperLeft,
+        "lower_left" => Quadrant::LowerLeft,
+        "lower_right" => Quadrant::LowerRight,
+        _ => Quadrant::UpperRight,
+    }
+}
+
+fn gate_shape_from_kind(kind: &GateKind) -> GateShape {
+    match kind {
+        GateKind::Rect {
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            angle,
+        } => GateShape::Rect {
+            x_min: *x_min,
+            x_max: *x_max,
+            y_min: *y_min,
+            y_max: *y_max,
+            angle: *angle,
+        },
+        GateKind::Ellipse {
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            angle,
+        } => GateShape::Ellipse {
+            x_min: *x_min,
+            x_max: *x_max,
+            y_min: *y_min,
+            y_max: *y_max,
+            angle: *angle,
+        },
+        GateKind::Polygon { vertices } => GateShape::Polygon {
+            vertices: vertices.clone(),
+        },
+        GateKind::Quadrant { x, y, quad } => GateShape::Quadrant {
+            x: *x,
+            y: *y,
+            quad: quadrant_id(quad).to_string(),
+        },
+        GateKind::Bilinear {
+            x1,
+            y1,
+            x2,
+            y2,
+            below,
+        } => GateShape::Bilinear {
+            x1: *x1,
+            y1: *y1,
+            x2: *x2,
+            y2: *y2,
+            below: *below,
+        },
+    }
+}
+
+fn gate_kind_from_shape(shape: &GateShape) -> GateKind {
+    match shape {
+        GateShape::Rect {
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            angle,
+        } => GateKind::Rect {
+            x_min: *x_min,
+            x_max: *x_max,
+            y_min: *y_min,
+            y_max: *y_max,
+            angle: *angle,
+        },
+        GateShape::Ellipse {
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            angle,
+        } => GateKind::Ellipse {
+            x_min: *x_min,
+            x_max: *x_max,
+            y_min: *y_min,
+            y_max: *y_max,
+            angle: *angle,
+        },
+        GateShape::Polygon { vertices } => GateKind::Polygon {
+            vertices: vertices.clone(),
+        },
+        GateShape::Quadrant { x, y, quad } => GateKind::Quadrant {
+            x: *x,
+            y: *y,
+            quad: quadrant_from_id(quad),
+        },
+        GateShape::Bilinear {
+            x1,
+            y1,
+            x2,
+            y2,
+            below,
+        } => GateKind::Bilinear {
+            x1: *x1,
+            y1: *y1,
+            x2: *x2,
+            y2: *y2,
+            below: *below,
+        },
+    }
+}
+
+fn label_to_project(l: &LabelStyle) -> ProjectLabel {
+    ProjectLabel {
+        text: l.text.clone(),
+        size: l.size,
+        rotation_deg: l.rotation_deg,
+        font: label_font_id(l.font).to_string(),
+        color: [l.color.r(), l.color.g(), l.color.b()],
+    }
+}
+
+fn label_from_project(l: &ProjectLabel) -> LabelStyle {
+    LabelStyle {
+        text: l.text.clone(),
+        size: l.size,
+        rotation_deg: l.rotation_deg,
+        font: label_font_from_id(&l.font),
+        color: egui::Color32::from_rgb(l.color[0], l.color[1], l.color[2]),
+    }
 }
 
 /// Data-space range for auto-scaling that respects the axis scale.
@@ -1675,11 +2095,25 @@ impl FlowersApp {
                         .to_string();
                     let params = fcs.parameters.len();
                     let events = fcs.event_count;
-                    self.samples.push(SampleEntry { id: id.clone(), fcs });
-                    self.current_sample = Some(self.samples.len() - 1);
-                    self.x_param = None;
-                    self.y_param = None;
+                    let had_gates = !self.gates.is_empty();
+                    let (dx, dy) = default_param_pair(&fcs);
+                    self.samples.push(SampleEntry {
+                        id: id.clone(),
+                        path: path.to_path_buf(),
+                        fcs,
+                        apply_gates: !had_gates,
+                    });
+                    let idx = self.samples.len() - 1;
+                    self.current_sample = Some(idx);
+                    self.x_param = Some(dx);
+                    self.y_param = Some(dy);
                     self.plot_points.clear();
+                    // Ask before applying an existing gating strategy to a new
+                    // file (the user decides per file).
+                    if had_gates {
+                        self.pending_apply_prompt = Some(idx);
+                    }
+                    self.update_plot_points();
                     self.set_status(format!(
                         "Loaded {id}: {events} events × {params} parameters"
                     ));
@@ -1694,20 +2128,366 @@ impl FlowersApp {
         self.status = msg.into();
     }
 
+    // -- undo / redo --------------------------------------------------------
+
+    /// Captures the current editable state.
+    fn snapshot(&self) -> UndoState {
+        UndoState {
+            gates: self.gates.clone(),
+            selected_gate: self.selected_gate,
+            x_param: self.x_param,
+            y_param: self.y_param,
+            view_mode: self.view_mode,
+            x_scale: self.x_scale,
+            y_scale: self.y_scale,
+            point_color: self.point_color,
+            gradient: self.gradient,
+            contour_levels: self.contour_levels,
+            x_range: self.x_range,
+            y_range: self.y_range,
+            layout_panels: self.layout_panels.clone(),
+            layout_columns: self.layout_columns,
+            layout_selected: self.layout_selected,
+        }
+    }
+
+    /// Restores a snapshot, refreshing derived data (scatter points, gates).
+    fn apply_state(&mut self, state: UndoState) {
+        self.gates = state.gates;
+        self.selected_gate = state.selected_gate;
+        self.x_param = state.x_param;
+        self.y_param = state.y_param;
+        self.x_scale = state.x_scale;
+        self.y_scale = state.y_scale;
+        // Recompute scatter points + populations for the restored parameters,
+        // then override the auto-fitted axis ranges with the stored ones.
+        self.update_plot_points();
+        self.x_range = state.x_range;
+        self.y_range = state.y_range;
+        self.view_mode = state.view_mode;
+        self.point_color = state.point_color;
+        self.gradient = state.gradient;
+        self.contour_levels = state.contour_levels;
+        self.layout_panels = state.layout_panels;
+        self.layout_columns = state.layout_columns;
+        self.layout_selected = state.layout_selected;
+        if self.layout_selected.is_some_and(|s| s >= self.layout_panels.len()) {
+            self.layout_selected = None;
+        }
+    }
+
+    fn can_undo(&self) -> bool {
+        self.history_idx > 0
+    }
+
+    fn can_redo(&self) -> bool {
+        self.history_idx + 1 < self.history.len()
+    }
+
+    fn undo(&mut self) {
+        if self.can_undo() {
+            self.history_idx -= 1;
+            let state = self.history[self.history_idx].clone();
+            self.apply_state(state);
+            self.history_skip = true;
+            self.set_status("Undo");
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.can_redo() {
+            self.history_idx += 1;
+            let state = self.history[self.history_idx].clone();
+            self.apply_state(state);
+            self.history_skip = true;
+            self.set_status("Redo");
+        }
+    }
+
+    /// Records the current state if it differs from the last snapshot.
+    ///
+    /// Called once per frame. While the pointer is down (mid-drag) the state is
+    /// not recorded, so an entire drag collapses into a single undo step.
+    fn record_history(&mut self, pointer_down: bool) {
+        if self.history_skip {
+            self.history_skip = false;
+            return;
+        }
+        let current = self.snapshot();
+        let changed = self
+            .history
+            .get(self.history_idx)
+            .map(|s| !s.same_document(&current))
+            .unwrap_or(true);
+        if !changed || pointer_down {
+            return;
+        }
+        // Drop any redo entries and append the new state.
+        self.history.truncate(self.history_idx + 1);
+        self.history.push(current);
+        const MAX_HISTORY: usize = 200;
+        if self.history.len() > MAX_HISTORY {
+            let excess = self.history.len() - MAX_HISTORY;
+            self.history.drain(0..excess);
+        }
+        self.history_idx = self.history.len() - 1;
+    }
+
+    // -- workspace (.wsp) ---------------------------------------------------
+
+    /// Resets the application to an empty workspace, keeping the theme.
+    fn new_workspace(&mut self) {
+        self.samples.clear();
+        self.gates.clear();
+        self.layout_panels.clear();
+        self.selected_gate = None;
+        self.layout_selected = None;
+        self.current_sample = None;
+        self.x_param = None;
+        self.y_param = None;
+        self.plot_points.clear();
+        self.pop_indices.clear();
+        self.children.clear();
+        self.pending_apply_prompt = None;
+        self.popout = PopoutState::default();
+        self.view_mode = ViewMode::Dots;
+        self.x_scale = AxisScale::Linear;
+        self.y_scale = AxisScale::Linear;
+        self.gradient = true;
+        self.contour_levels = 8;
+        self.point_color = egui::Color32::from_rgb(31, 119, 180);
+        self.x_range = (0.0, 1.0);
+        self.y_range = (0.0, 1.0);
+        self.layout_columns = 2;
+        self.history.clear();
+        self.history_idx = 0;
+        self.record_history(false);
+        self.set_status("New workspace");
+    }
+
+    /// Builds a serialisable snapshot of the current analysis.
+    fn to_project(&self) -> Project {
+        let samples = self
+            .samples
+            .iter()
+            .map(|s| ProjectSample {
+                path: s.path.to_string_lossy().to_string(),
+                apply_gates: s.apply_gates,
+            })
+            .collect();
+        let gates = self
+            .gates
+            .iter()
+            .map(|g| ProjectGate {
+                name: g.name.clone(),
+                x_idx: g.x_idx,
+                y_idx: g.y_idx,
+                parent: g.parent,
+                owner: g.owner,
+                apply_to_all: g.apply_to_all,
+                color: [g.color.r(), g.color.g(), g.color.b()],
+                kind: gate_shape_from_kind(&g.kind),
+            })
+            .collect();
+        let layout = self
+            .layout_panels
+            .iter()
+            .map(|p| ProjectPanel {
+                sample: p.sample,
+                x: p.x,
+                y: p.y,
+                view: view_mode_id(p.view).to_string(),
+                gate: p.gate,
+                title: p.title.clone(),
+                rect: [p.rect.min.x, p.rect.min.y, p.rect.width(), p.rect.height()],
+                x_label: label_to_project(&p.x_label),
+                y_label: label_to_project(&p.y_label),
+            })
+            .collect();
+        Project {
+            version: crate::project::PROJECT_VERSION,
+            samples,
+            current_sample: self.current_sample,
+            x_param: self.x_param,
+            y_param: self.y_param,
+            selected_gate: self.selected_gate,
+            view: ViewSettings {
+                mode: view_mode_id(self.view_mode).to_string(),
+                x_scale: axis_scale_id(self.x_scale).to_string(),
+                y_scale: axis_scale_id(self.y_scale).to_string(),
+                point_color: [self.point_color.r(), self.point_color.g(), self.point_color.b()],
+                gradient: self.gradient,
+                contour_levels: self.contour_levels,
+                x_range: self.x_range,
+                y_range: self.y_range,
+            },
+            gates,
+            layout,
+            layout_columns: self.layout_columns,
+        }
+    }
+
+    /// Writes the current analysis to `path` as a `.wsp` (JSON) file.
+    fn save_workspace(&mut self, path: &std::path::Path) {
+        let project = self.to_project();
+        match crate::project::to_json(&project) {
+            Ok(json) => match std::fs::write(path, json) {
+                Ok(()) => self.set_status(format!(
+                    "Saved workspace: {} sample(s), {} gate(s)",
+                    project.samples.len(),
+                    project.gates.len()
+                )),
+                Err(e) => self.set_status(format!("Error writing workspace: {e}")),
+            },
+            Err(e) => self.set_status(format!("Error encoding workspace: {e}")),
+        }
+    }
+
+    /// Loads a `.wsp` file, re-reading the referenced FCS files.
+    fn load_workspace(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_status(format!("Error reading workspace: {e}"));
+                return;
+            }
+        };
+        match crate::project::from_json(&text) {
+            Ok(project) => self.apply_project(project),
+            Err(e) => self.set_status(format!("Error parsing workspace: {e}")),
+        }
+    }
+
+    /// Replaces the current state with a loaded project.
+    fn apply_project(&mut self, project: Project) {
+        self.samples.clear();
+        self.gates.clear();
+        self.layout_panels.clear();
+        self.selected_gate = None;
+        self.layout_selected = None;
+        self.current_sample = None;
+        self.pending_apply_prompt = None;
+        self.popout = PopoutState::default();
+
+        // View settings (axis ranges are restored after the samples load, since
+        // `update_plot_points` auto-fits them).
+        self.view_mode = view_mode_from_id(&project.view.mode);
+        self.x_scale = axis_scale_from_id(&project.view.x_scale);
+        self.y_scale = axis_scale_from_id(&project.view.y_scale);
+        let [r, g, b] = project.view.point_color;
+        self.point_color = egui::Color32::from_rgb(r, g, b);
+        self.gradient = project.view.gradient;
+        self.contour_levels = project.view.contour_levels;
+
+        // Load the referenced FCS files.
+        let mut missing: Vec<String> = Vec::new();
+        for s in &project.samples {
+            let p = std::path::Path::new(&s.path);
+            match std::fs::read(p) {
+                Ok(bytes) => match FcsParser::parse_bytes(&bytes) {
+                    Ok(fcs) => {
+                        let id = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        self.samples.push(SampleEntry {
+                            id,
+                            path: p.to_path_buf(),
+                            fcs,
+                            apply_gates: s.apply_gates,
+                        });
+                    }
+                    Err(e) => missing.push(format!("{} (parse: {e})", s.path)),
+                },
+                Err(e) => missing.push(format!("{} ({e})", s.path)),
+            }
+        }
+
+        // Gates.
+        for pg in &project.gates {
+            self.gates.push(GateDef {
+                name: pg.name.clone(),
+                x_idx: pg.x_idx,
+                y_idx: pg.y_idx,
+                parent: pg.parent,
+                kind: gate_kind_from_shape(&pg.kind),
+                color: egui::Color32::from_rgb(pg.color[0], pg.color[1], pg.color[2]),
+                owner: pg.owner,
+                apply_to_all: pg.apply_to_all,
+            });
+        }
+
+        // Layout panels.
+        self.layout_columns = project.layout_columns.max(1);
+        for pp in &project.layout {
+            if pp.sample >= self.samples.len() {
+                continue;
+            }
+            let preview = self.make_layout_preview(pp.sample, pp.x, pp.y);
+            self.layout_panels.push(LayoutPanelSpec {
+                sample: pp.sample,
+                x: pp.x,
+                y: pp.y,
+                view: view_mode_from_id(&pp.view),
+                gate: pp.gate,
+                title: pp.title.clone(),
+                rect: egui::Rect::from_min_size(
+                    egui::pos2(pp.rect[0], pp.rect[1]),
+                    egui::vec2(pp.rect[2].max(1.0), pp.rect[3].max(1.0)),
+                ),
+                preview,
+                x_label: label_from_project(&pp.x_label),
+                y_label: label_from_project(&pp.y_label),
+            });
+        }
+
+        // Selection.
+        self.current_sample = project
+            .current_sample
+            .filter(|&i| i < self.samples.len())
+            .or_else(|| (!self.samples.is_empty()).then_some(0));
+        self.x_param = project.x_param;
+        self.y_param = project.y_param;
+        self.selected_gate = project.selected_gate.filter(|&i| i < self.gates.len());
+        if let Some(fcs) = self.current_fcs() {
+            let (dx, dy) = default_param_pair(fcs);
+            if self.x_param.is_none() {
+                self.x_param = Some(dx);
+            }
+            if self.y_param.is_none() {
+                self.y_param = Some(dy);
+            }
+        }
+        self.update_plot_points();
+        // Override the auto-fitted ranges with the saved ones.
+        self.x_range = project.view.x_range;
+        self.y_range = project.view.y_range;
+
+        // The loaded state is the new baseline for undo / redo.
+        self.history.clear();
+        self.history_idx = 0;
+        self.record_history(false);
+
+        if missing.is_empty() {
+            self.set_status(format!(
+                "Loaded workspace: {} sample(s), {} gate(s)",
+                self.samples.len(),
+                self.gates.len()
+            ));
+        } else {
+            self.set_status(format!(
+                "Loaded workspace; {} file(s) could not be opened: {}",
+                missing.len(),
+                missing.join("; ")
+            ));
+        }
+    }
+
     /// Load files (e.g. from the command line) and prime the first plot.
     pub fn open_paths(&mut self, paths: &[std::path::PathBuf]) {
         for p in paths {
             self.load_file(p);
-        }
-        if self.current_sample.is_some() && self.x_param.is_none() {
-            if let Some(fcs) = self.current_fcs() {
-                let n = fcs.parameters.len();
-                if n > 0 {
-                    self.x_param = Some(0);
-                    self.y_param = Some(if n > 1 { 1 } else { 0 });
-                }
-            }
-            self.update_plot_points();
         }
     }
 
@@ -1741,9 +2521,14 @@ impl FlowersApp {
 
     /// Recompute the event indices of every gate for the current sample.
     fn recompute_populations(&mut self) {
+        let apply_gates = self
+            .current_sample
+            .and_then(|i| self.samples.get(i))
+            .map(|s| s.apply_gates)
+            .unwrap_or(false);
         self.pop_indices = match self.current_fcs() {
             Some(fcs) => {
-                compute_gate_populations(&fcs.data, &self.gates, self.current_sample)
+                compute_gate_populations(&fcs.data, &self.gates, self.current_sample, apply_gates)
             }
             None => vec![Vec::new(); self.gates.len()],
         };
@@ -1868,8 +2653,26 @@ impl FlowersApp {
                 created = self.create_quadrant_at([cx, cy], x_idx, y_idx, parent);
             }
             NewGateType::Bilinear => {
-                let radius = ((x_max - x_min).abs().max((y_max - y_min).abs())) / 2.0;
-                created = self.create_bilinear_at([cx, cy], radius, x_idx, y_idx, parent);
+                // Use the drag itself as the dividing line: the gate is the
+                // region under that line, bounded by the segment's X extent.
+                let len = ((end[0] - start[0]).powi(2) + (end[1] - start[1]).powi(2)).sqrt();
+                if len < f64::EPSILON {
+                    return created;
+                }
+                let n = self.gates.len() + 1;
+                created.push(self.push_gate(
+                    format!("Bilinear {n}"),
+                    GateKind::Bilinear {
+                        x1: start[0],
+                        y1: start[1],
+                        x2: end[0],
+                        y2: end[1],
+                        below: true,
+                    },
+                    parent,
+                    x_idx,
+                    y_idx,
+                ));
             }
         }
         self.finish_gate_creation();
@@ -1924,7 +2727,8 @@ impl FlowersApp {
         created
     }
 
-    /// Create bilinear gates as a horizontal-line threshold (below / above).
+    /// Create a single line gate as a horizontal threshold at `center[1]`,
+    /// spanning `center[0] ± radius`. Used by "+ Add Gate" and click-to-place.
     fn create_bilinear_at(
         &mut self,
         center: [f64; 2],
@@ -1934,38 +2738,21 @@ impl FlowersApp {
         parent: Option<usize>,
     ) -> Vec<usize> {
         let base = self.gates.len() + 1;
-        let radius = radius.max(1.0);
-        let mut created = Vec::new();
-        // Both dividing lines are horizontal (angle = 0), so each gate selects
-        // one side of a single horizontal threshold line at `cy`.
-        //   d = (x - cx) * sin(0) - (y - cy) * cos(0) = cy - y
-        //   side = true  → d >= 0 → y <= cy  (below the line)
-        //   side = false → d < 0  → y >  cy  (above the line)
-        for (_i, (name, s1, s2)) in [
-            (format!("B{base}.1 Below"), true, true),
-            (format!("B{base}.2 Above"), false, false),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let kind = GateKind::Bilinear {
-                cx: center[0],
-                cy: center[1],
-                angle1: 0.0,
-                angle2: 0.0,
-                radius,
-                side1: s1,
-                side2: s2,
-            };
-            created.push(self.push_gate(
-                name,
-                kind,
-                parent,
-                x_idx,
-                y_idx,
-            ));
-        }
-        created
+        let r = radius.max(1.0);
+        let kind = GateKind::Bilinear {
+            x1: center[0] - r,
+            y1: center[1],
+            x2: center[0] + r,
+            y2: center[1],
+            below: true,
+        };
+        vec![self.push_gate(
+            format!("Bilinear {base}"),
+            kind,
+            parent,
+            x_idx,
+            y_idx,
+        )]
     }
 
     fn finish_gate_creation(&mut self) {
@@ -2219,8 +3006,9 @@ impl FlowersApp {
                 }
             }
             ui.label("range:");
-            ui.add(egui::DragValue::new(&mut self.popout.x_range.0).speed(1.0));
-            ui.add(egui::DragValue::new(&mut self.popout.x_range.1).speed(1.0));
+            let span = (self.popout.x_range.1 - self.popout.x_range.0).abs().max(1.0);
+            ui.add(range_drag_value(&mut self.popout.x_range.0, span));
+            ui.add(range_drag_value(&mut self.popout.x_range.1, span));
         });
         ui.horizontal(|ui| {
             ui.label("Y scale:");
@@ -2234,8 +3022,9 @@ impl FlowersApp {
                 }
             }
             ui.label("range:");
-            ui.add(egui::DragValue::new(&mut self.popout.y_range.0).speed(1.0));
-            ui.add(egui::DragValue::new(&mut self.popout.y_range.1).speed(1.0));
+            let span = (self.popout.y_range.1 - self.popout.y_range.0).abs().max(1.0);
+            ui.add(range_drag_value(&mut self.popout.y_range.0, span));
+            ui.add(range_drag_value(&mut self.popout.y_range.1, span));
         });
 
         ui.horizontal(|ui| {
@@ -2390,6 +3179,7 @@ impl FlowersApp {
                 format!("{} ({})", y_label, scale_label(self.y_scale))
             },
             interactive: true,
+            line_preview: matches!(self.new_gate_type, NewGateType::Bilinear),
         }
     }
 
@@ -2431,6 +3221,7 @@ impl FlowersApp {
                 &fcs.data,
                 x,
                 &param_display_name(fcs, x),
+                "Count",
                 &[],
                 Some((self.x_range.0 as f32, self.x_range.1 as f32)),
                 50,
@@ -2493,6 +3284,7 @@ impl FlowersApp {
                 &sample.fcs.data,
                 &self.gates,
                 Some(sample_idx),
+                sample.apply_gates,
             );
             for (i, gate) in self.gates.iter().enumerate() {
                 if i >= pops.len() {
@@ -2544,6 +3336,24 @@ impl FlowersApp {
             .filter_map(|spec| {
                 let sample = self.samples.get(spec.sample)?;
                 let fcs = &sample.fcs;
+                let x_text = spec
+                    .x_label
+                    .text
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| param_display_name(fcs, spec.x));
+                let y_text = spec
+                    .y_label
+                    .text
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if matches!(spec.view, ViewMode::Histogram) {
+                            "Count".to_string()
+                        } else {
+                            param_display_name(fcs, spec.y)
+                        }
+                    });
                 let style = PlotStyle {
                     point_color: color_to_hex(self.point_color),
                     x_scale: AxisScale::Linear,
@@ -2552,13 +3362,20 @@ impl FlowersApp {
                     contour: matches!(spec.view, ViewMode::Contour),
                     contour_levels: self.contour_levels,
                     title: spec.title.clone(),
+                    x_label_size: spec.x_label.size,
+                    y_label_size: spec.y_label.size,
+                    x_label_rotation: spec.x_label.rotation_deg,
+                    y_label_rotation: spec.y_label.rotation_deg,
+                    x_label_font: spec.x_label.font.css().to_string(),
+                    y_label_font: spec.y_label.font.css().to_string(),
                     ..Default::default()
                 };
                 let svg = if matches!(spec.view, ViewMode::Histogram) {
                     crate::plot::histogram_svg(
                         &fcs.data,
                         spec.x,
-                        &param_display_name(fcs, spec.x),
+                        &x_text,
+                        &y_text,
                         &[],
                         None,
                         50,
@@ -2568,18 +3385,23 @@ impl FlowersApp {
                     let indices: Vec<usize> = spec
                         .gate
                         .map(|g| {
-                            compute_gate_populations(&fcs.data, &self.gates, Some(spec.sample))
-                                .get(g)
-                                .cloned()
-                                .unwrap_or_default()
+                            compute_gate_populations(
+                                &fcs.data,
+                                &self.gates,
+                                Some(spec.sample),
+                                sample.apply_gates,
+                            )
+                            .get(g)
+                            .cloned()
+                            .unwrap_or_default()
                         })
                         .unwrap_or_default();
                     dot_plot_svg(
                         &fcs.data,
                         spec.x,
                         spec.y,
-                        &param_display_name(fcs, spec.x),
-                        &param_display_name(fcs, spec.y),
+                        &x_text,
+                        &y_text,
                         &indices,
                         None,
                         None,
@@ -2655,6 +3477,8 @@ impl FlowersApp {
             title,
             rect,
             preview,
+            x_label: LabelStyle::x_default(),
+            y_label: LabelStyle::y_default(),
         });
         self.layout_selected = Some(self.layout_panels.len() - 1);
         self.layout_open = true;
@@ -2691,6 +3515,8 @@ impl FlowersApp {
             title,
             rect,
             preview,
+            x_label: LabelStyle::x_default(),
+            y_label: LabelStyle::y_default(),
         });
         self.layout_selected = Some(self.layout_panels.len() - 1);
         self.layout_open = true;
@@ -2727,7 +3553,7 @@ impl FlowersApp {
         // Collect the (x, y) values for all events or the gated subset.
         let pts: Vec<[f64; 2]> = match gate {
             Some(g) => {
-                let pops = compute_gate_populations(&fcs.data, &self.gates, Some(sample));
+                let pops = compute_gate_populations(&fcs.data, &self.gates, Some(sample), s.apply_gates);
                 let idxs = pops.get(g).cloned().unwrap_or_default();
                 idxs.iter()
                     .map(|&e| [fcs.data[[e, x]] as f64, fcs.data[[e, y]] as f64])
@@ -2898,23 +3724,45 @@ impl FlowersApp {
                 );
             }
 
-            // Axis labels.
+            // Axis labels (using the per-panel label style).
             let fcs = &self.samples[panel.sample].fcs;
-            let x_name = param_display_name(fcs, panel.x);
-            let y_name = param_display_name(fcs, panel.y);
-            painter.text(
+            let x_text = panel
+                .x_label
+                .text
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| param_display_name(fcs, panel.x));
+            let y_text = panel
+                .y_label
+                .text
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if matches!(panel.view, ViewMode::Histogram) {
+                        "Count".to_string()
+                    } else {
+                        param_display_name(fcs, panel.y)
+                    }
+                });
+            // Panels are authored at 500x450, so scale label text to the panel.
+            let lscale = (r.width() / 500.0).clamp(0.25, 4.0);
+            paint_label(
+                &painter,
                 r.min + egui::vec2(r.width() / 2.0, r.height() - 5.0),
-                egui::Align2::CENTER_TOP,
-                &x_name,
-                egui::FontId::proportional(9.0),
-                egui::Color32::from_gray(100),
+                &x_text,
+                panel.x_label.size * lscale,
+                panel.x_label.color,
+                panel.x_label.font.egui(),
+                panel.x_label.rotation_deg.to_radians(),
             );
-            painter.text(
+            paint_label(
+                &painter,
                 r.min + egui::vec2(6.0, r.height() / 2.0),
-                egui::Align2::CENTER_CENTER,
-                &y_name,
-                egui::FontId::proportional(9.0),
-                egui::Color32::from_gray(100),
+                &y_text,
+                panel.y_label.size * lscale,
+                panel.y_label.color,
+                panel.y_label.font.egui(),
+                panel.y_label.rotation_deg.to_radians(),
             );
 
             let stroke = if selected {
@@ -3016,6 +3864,53 @@ impl FlowersApp {
                 egui::ScrollArea::both().show(ui, |ui| {
                     self.layout_canvas(ui);
                 });
+
+                // Per-axis label styling for the selected panel.
+                if let Some(i) = self.layout_selected {
+                    if let Some(panel) = self.layout_panels.get_mut(i) {
+                        ui.separator();
+                        ui.strong("Axis label style (selected panel)");
+                        ui.horizontal(|ui| {
+                            ui.label("X text:");
+                            label_text_edit(ui, "lx_text", &mut panel.x_label);
+                            ui.label("size:");
+                            ui.add(
+                                egui::DragValue::new(&mut panel.x_label.size)
+                                    .range(4.0..=72.0)
+                                    .speed(0.5),
+                            );
+                            ui.label("rotate:");
+                            ui.add(
+                                egui::DragValue::new(&mut panel.x_label.rotation_deg)
+                                    .range(-180.0..=180.0)
+                                    .suffix("°"),
+                            );
+                            label_font_combo(ui, "lx_font", &mut panel.x_label.font);
+                            ui.color_edit_button_srgba(&mut panel.x_label.color);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Y text:");
+                            label_text_edit(ui, "ly_text", &mut panel.y_label);
+                            ui.label("size:");
+                            ui.add(
+                                egui::DragValue::new(&mut panel.y_label.size)
+                                    .range(4.0..=72.0)
+                                    .speed(0.5),
+                            );
+                            ui.label("rotate:");
+                            ui.add(
+                                egui::DragValue::new(&mut panel.y_label.rotation_deg)
+                                    .range(-180.0..=180.0)
+                                    .suffix("°"),
+                            );
+                            label_font_combo(ui, "ly_font", &mut panel.y_label.font);
+                            ui.color_edit_button_srgba(&mut panel.y_label.color);
+                        });
+                        ui.weak(
+                            "Leave a text box blank to use the parameter name. The (linear)/(log) suffix is kept.",
+                        );
+                    }
+                }
 
                 // Per-panel quick list (select / remove).
                 ui.separator();
@@ -3193,6 +4088,22 @@ impl eframe::App for FlowersApp {
             Theme::Light => egui::Visuals::light(),
         });
 
+        // ----- Undo / redo keyboard shortcuts -----
+        // Skipped while a text field has focus so the widget keeps its own undo.
+        if !ctx.wants_keyboard_input() {
+            let cmd = egui::Modifiers::COMMAND;
+            // Most specific shortcut first: extra Shift is ignored by matching.
+            let redo_shift = ctx
+                .input_mut(|i| i.consume_key(cmd | egui::Modifiers::SHIFT, egui::Key::Z));
+            let redo_y = ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Y));
+            let undo = ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Z));
+            if redo_shift || redo_y {
+                self.redo();
+            } else if undo {
+                self.undo();
+            }
+        }
+
         // ----- Top menu -----
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -3204,6 +4115,31 @@ impl eframe::App for FlowersApp {
                             self.load_file(&path);
                         }
                     }
+                    ui.separator();
+                    if ui.button("New Workspace").clicked() {
+                        ui.close_menu();
+                        self.new_workspace();
+                    }
+                    if ui.button("Load Workspace…").clicked() {
+                        ui.close_menu();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Flowers workspace", &["wsp", "json"])
+                            .pick_file()
+                        {
+                            self.load_workspace(&path);
+                        }
+                    }
+                    if ui.button("Save Workspace…").clicked() {
+                        ui.close_menu();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Flowers workspace", &["wsp", "json"])
+                            .set_file_name("workspace.wsp")
+                            .save_file()
+                        {
+                            self.save_workspace(&path);
+                        }
+                    }
+                    ui.separator();
                     if ui.button("Export SVG").clicked() {
                         ui.close_menu();
                         if let Some(path) = rfd::FileDialog::new()
@@ -3238,6 +4174,42 @@ impl eframe::App for FlowersApp {
                     if ui.button("Quit").clicked() {
                         ui.close_menu();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+
+                // Edit dropdown (undo / redo).
+                ui.menu_button("Edit", |ui| {
+                    let undo_shortcut = egui::KeyboardShortcut::new(
+                        egui::Modifiers::COMMAND,
+                        egui::Key::Z,
+                    );
+                    let redo_shortcut = egui::KeyboardShortcut::new(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::Z,
+                    );
+                    if ui
+                        .add_enabled(
+                            self.can_undo(),
+                            egui::Button::new("Undo").shortcut_text(
+                                ui.ctx().format_shortcut(&undo_shortcut),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.undo();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.can_redo(),
+                            egui::Button::new("Redo").shortcut_text(
+                                ui.ctx().format_shortcut(&redo_shortcut),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.redo();
                     }
                 });
 
@@ -3283,15 +4255,33 @@ impl eframe::App for FlowersApp {
                 ui.separator();
                 ui.label("Loaded samples:");
                 let mut clicked_sample: Option<usize> = None;
+                let mut toggled_gates: Option<(usize, bool)> = None;
                 for (i, sample) in self.samples.iter().enumerate() {
                     let selected = self.current_sample == Some(i);
-                    if ui.selectable_label(selected, &sample.id).clicked() {
-                        clicked_sample = Some(i);
-                    }
+                    let id = sample.id.clone();
+                    let mut apply = sample.apply_gates;
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(selected, &id).clicked() {
+                            clicked_sample = Some(i);
+                        }
+                        if ui
+                            .checkbox(&mut apply, "gates")
+                            .on_hover_text("Apply the shared gate set to this file")
+                            .changed()
+                        {
+                            toggled_gates = Some((i, apply));
+                        }
+                    });
                 }
                 if let Some(i) = clicked_sample {
                     self.current_sample = Some(i);
                     self.update_plot_points();
+                }
+                if let Some((i, apply)) = toggled_gates {
+                    if let Some(s) = self.samples.get_mut(i) {
+                        s.apply_gates = apply;
+                    }
+                    self.recompute_populations();
                 }
                 if self.samples.is_empty() {
                     ui.weak("(none)");
@@ -3363,8 +4353,9 @@ impl eframe::App for FlowersApp {
                         });
                         ui.horizontal(|ui| {
                             ui.label("X range:");
-                            ui.add(egui::DragValue::new(&mut self.x_range.0).speed(1.0));
-                            ui.add(egui::DragValue::new(&mut self.x_range.1).speed(1.0));
+                            let span = (self.x_range.1 - self.x_range.0).abs().max(1.0);
+                            ui.add(range_drag_value(&mut self.x_range.0, span));
+                            ui.add(range_drag_value(&mut self.x_range.1, span));
                             if ui.small_button("Auto").on_hover_text("Fit X to data").clicked() {
                                 self.auto_x();
                             }
@@ -3383,8 +4374,9 @@ impl eframe::App for FlowersApp {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Y range:");
-                            ui.add(egui::DragValue::new(&mut self.y_range.0).speed(1.0));
-                            ui.add(egui::DragValue::new(&mut self.y_range.1).speed(1.0));
+                            let span = (self.y_range.1 - self.y_range.0).abs().max(1.0);
+                            ui.add(range_drag_value(&mut self.y_range.0, span));
+                            ui.add(range_drag_value(&mut self.y_range.1, span));
                             if ui.small_button("Auto").on_hover_text("Fit Y to data").clicked() {
                                 self.auto_y();
                             }
@@ -3532,7 +4524,10 @@ impl eframe::App for FlowersApp {
                         // Apply-to-all toggle.
                         ui.horizontal(|ui| {
                             ui.label("Apply to all samples:");
-                            ui.checkbox(&mut self.gates[i].apply_to_all, "");
+                            ui.checkbox(&mut self.gates[i].apply_to_all, "")
+                                .on_hover_text(
+                                    "Off: this gate applies only to its owner sample. On: it also applies to every other sample that has gating enabled (the \"gates\" checkbox in the sample list).",
+                                );
                             if let Some(owner_idx) = self.gates[i].owner {
                                 ui.label(format!(
                                     "(created on sample {})",
@@ -3645,39 +4640,27 @@ impl eframe::App for FlowersApp {
                         ui.label("Tip: all four quadrant gates share the same split point when drawn together.");
                     }
                     GateKind::Bilinear {
-                        cx,
-                        cy,
-                        angle1,
-                        angle2,
-                        radius,
-                        side1,
-                        side2,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        below,
                     } => {
                         ui.horizontal(|ui| {
-                            ui.label("Centre X:");
-                            changed |= ui.add(egui::DragValue::new(cx).speed(1.0)).changed();
-                            ui.label("Centre Y:");
-                            changed |= ui.add(egui::DragValue::new(cy).speed(1.0)).changed();
+                            ui.label("Start X:");
+                            changed |= ui.add(egui::DragValue::new(x1).speed(1.0)).changed();
+                            ui.label("Start Y:");
+                            changed |= ui.add(egui::DragValue::new(y1).speed(1.0)).changed();
+                            ui.label("End X:");
+                            changed |= ui.add(egui::DragValue::new(x2).speed(1.0)).changed();
+                            ui.label("End Y:");
+                            changed |= ui.add(egui::DragValue::new(y2).speed(1.0)).changed();
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Angle 1 (deg):");
-                            let mut deg1 = angle1.to_degrees();
-                            if ui.add(egui::DragValue::new(&mut deg1).speed(1.0)).changed() {
-                                *angle1 = deg1.to_radians();
-                                changed = true;
-                            }
-                            ui.label("Angle 2 (deg):");
-                            let mut deg2 = angle2.to_degrees();
-                            if ui.add(egui::DragValue::new(&mut deg2).speed(1.0)).changed() {
-                                *angle2 = deg2.to_radians();
-                                changed = true;
-                            }
-                            ui.label("Length:");
-                            changed |= ui.add(egui::DragValue::new(radius).speed(1.0)).changed();
-                        });
-                        ui.horizontal(|ui| {
-                            changed |= ui.checkbox(side1, "Positive side of line 1").changed();
-                            changed |= ui.checkbox(side2, "Positive side of line 2").changed();
+                            changed |= ui
+                                .checkbox(below, "Select points below the line")
+                                .changed();
+                            ui.weak("(uncheck to select the region above)");
                         });
                     }
                 }
@@ -3790,6 +4773,7 @@ impl eframe::App for FlowersApp {
                                     &sample.fcs.data,
                                     &self.gates,
                                     Some(sample_idx),
+                                    sample.apply_gates,
                                 );
                                 for (i, gate) in self.gates.iter().enumerate() {
                                     let c = pops.get(i).map(|v| v.len()).unwrap_or(0);
@@ -3844,6 +4828,17 @@ impl eframe::App for FlowersApp {
                         return;
                     }
 
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Add this plot to layout")
+                            .on_hover_text("Add this detached population view to the Layout Editor")
+                            .clicked()
+                        {
+                            self.add_layout_popout();
+                        }
+                    });
+                    ui.separator();
+
                     // The detached window exposes the same controls as the main
                     // window: axes, ranges, scales, colour, view and gating.
                     self.popout_controls(ui, i);
@@ -3891,6 +4886,7 @@ impl eframe::App for FlowersApp {
                             format!("{y_label} ({})", scale_label(self.popout.y_scale))
                         },
                         interactive: true,
+                        line_preview: matches!(self.popout.new_gate_type, NewGateType::Bilinear),
                     };
                     ui.label(format!("{} events shown — drag to gate, drag handles to edit", cfg.points.len()));
 
@@ -3941,5 +4937,340 @@ impl eframe::App for FlowersApp {
                 });
             self.popout.open = open;
         }
+
+        // ----- "Apply existing gates to this file?" prompt -----
+        if let Some(idx) = self.pending_apply_prompt {
+            if idx >= self.samples.len() {
+                self.pending_apply_prompt = None;
+            } else {
+                let name = self.samples[idx].id.clone();
+                let n = self.gates.len();
+                let mut choice: Option<bool> = None;
+                egui::Window::new("Apply gates to new file?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!("Loaded \"{name}\"."));
+                        ui.label(format!(
+                            "Apply the existing {n} gate(s) to this file?"
+                        ));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Apply gates").clicked() {
+                                choice = Some(true);
+                            }
+                            if ui.button("Don't apply").clicked() {
+                                choice = Some(false);
+                            }
+                        });
+                        ui.weak("You can change this later with the \"gates\" checkbox in the sample list.");
+                    });
+                if let Some(apply) = choice {
+                    if let Some(s) = self.samples.get_mut(idx) {
+                        s.apply_gates = apply;
+                    }
+                    self.pending_apply_prompt = None;
+                    self.recompute_populations();
+                }
+            }
+        }
+
+        // ----- Undo history -----
+        // Record once per frame (coalescing drags into a single step).
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+        self.record_history(pointer_down);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fcs::{FcsFile, Parameter};
+    use ndarray::array;
+    use std::collections::HashMap;
+
+    fn fcs_with(names: &[&str]) -> FcsFile {
+        let parameters = names
+            .iter()
+            .map(|n| Parameter {
+                name: (*n).to_string(),
+                description: (*n).to_string(),
+                range: 1.0,
+                exponent: 0.0,
+                min: 0.0,
+                max: 1.0,
+            })
+            .collect();
+        FcsFile {
+            version: "FCS3.1".to_string(),
+            keywords: HashMap::new(),
+            parameters,
+            event_count: 0,
+            data: ndarray::Array2::zeros((0, names.len())),
+        }
+    }
+
+    #[test]
+    fn default_axes_prefer_fsc_h_and_ssc_h() {
+        let fcs = fcs_with(&["FSC-A", "SSC-A", "FSC-H", "SSC-H", "CD3"]);
+        assert_eq!(default_param_pair(&fcs), (2, 3));
+
+        // Lazily falls back to FSC-A / SSC-A.
+        let fcs = fcs_with(&["FSC-A", "SSC-A", "CD3"]);
+        assert_eq!(default_param_pair(&fcs), (0, 1));
+
+        // No FSC/SSC channels: use the first two parameters.
+        let fcs = fcs_with(&["A", "B", "C"]);
+        assert_eq!(default_param_pair(&fcs), (0, 1));
+
+        // Single parameter: both axes clamp to index 0.
+        let fcs = fcs_with(&["FSC-H"]);
+        assert_eq!(default_param_pair(&fcs), (0, 0));
+    }
+
+    #[test]
+    fn edit_number_formatting_round_trips() {
+        assert_eq!(format_edit_num(0.0), "0");
+        assert_eq!(format_edit_num(7_000_000.0), "7e6");
+        assert_eq!(format_edit_num(5_300_871.0), "5.300871e6");
+        assert_eq!(format_edit_num(123.0), "123");
+        assert_eq!(format_edit_num(1.5), "1.5");
+        assert_eq!(format_edit_num(1e-4), "1e-4");
+        // The shown text must parse back to exactly the original value.
+        for v in [0.0, 7_000_000.0, 5_300_871.0, 123.0, 1.5, 1e-4, 42.0, 0.015] {
+            let s = format_edit_num(v);
+            let back: f64 = s.parse().unwrap_or_else(|_| panic!("{s} did not parse"));
+            assert_eq!(back, v, "{v} -> {s} -> {back}");
+        }
+    }
+
+    #[test]
+    fn undo_redo_restores_gate_edits() {
+        let rect = || GateKind::Rect {
+            x_min: 0.0,
+            x_max: 1.0,
+            y_min: 0.0,
+            y_max: 1.0,
+            angle: 0.0,
+        };
+        let mut app = FlowersApp::default();
+        // Seed the empty starting state (as the first frame would).
+        app.record_history(false);
+        assert!(!app.can_undo());
+        assert!(!app.can_redo());
+
+        app.push_gate("G1".into(), rect(), None, 0, 1);
+        app.record_history(false);
+        assert_eq!(app.gates.len(), 1);
+        assert!(app.can_undo());
+
+        app.push_gate("G2".into(), rect(), None, 0, 1);
+        app.record_history(false);
+        assert_eq!(app.gates.len(), 2);
+
+        app.undo();
+        assert_eq!(app.gates.len(), 1);
+        assert!(app.can_redo());
+        app.undo();
+        assert_eq!(app.gates.len(), 0);
+        assert!(!app.can_undo());
+
+        app.redo();
+        assert_eq!(app.gates.len(), 1);
+        app.redo();
+        assert_eq!(app.gates.len(), 2);
+        assert!(!app.can_redo());
+    }
+
+    #[test]
+    fn undo_is_not_duplicated_when_nothing_changes() {
+        let mut app = FlowersApp::default();
+        app.record_history(false);
+        // No edit: repeated frames must not grow the history.
+        app.record_history(false);
+        app.record_history(false);
+        assert_eq!(app.history.len(), 1);
+        assert!(!app.can_undo());
+    }
+
+    #[test]
+    fn selecting_a_gate_does_not_create_history_entry() {
+        let mut app = FlowersApp::default();
+        app.record_history(false);
+        app.push_gate(
+            "G1".into(),
+            GateKind::Rect {
+                x_min: 0.0,
+                x_max: 1.0,
+                y_min: 0.0,
+                y_max: 1.0,
+                angle: 0.0,
+            },
+            None,
+            0,
+            1,
+        );
+        app.record_history(false);
+        assert_eq!(app.history.len(), 2);
+        // Selecting a gate is navigation, not an edit.
+        app.selected_gate = Some(0);
+        app.record_history(false);
+        assert_eq!(app.history.len(), 2);
+        assert!(!app.can_redo());
+    }
+
+    /// Writes a minimal, valid FCS 3.0 file (see `workspace::tests`).
+    fn write_fcs(path: &std::path::Path, events: usize, params: usize) {
+        use crate::fcs::FCS_HEADER_LEN;
+        let mut text = Vec::new();
+        text.push(b'/');
+        text.extend_from_slice(format!("$TOT/{events}/").as_bytes());
+        text.extend_from_slice(format!("$PAR/{params}/").as_bytes());
+        for n in 1..=params {
+            text.extend_from_slice(format!("$P{n}N/P{n}/").as_bytes());
+            text.extend_from_slice(format!("$P{n}R/4.0/").as_bytes());
+        }
+        text.extend_from_slice(b"$BYTEORD/1,2,3,4/");
+        let text_start = FCS_HEADER_LEN;
+        let text_end = text_start + text.len();
+        let data_start = text_end;
+        let data_end = data_start;
+        let analysis_start = data_end + 1;
+        let analysis_end = analysis_start + 1;
+        fn ptr(n: usize) -> [u8; 8] {
+            let s = format!("{n:>8}");
+            let mut b = [0u8; 8];
+            b.copy_from_slice(s.as_bytes());
+            b
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"FCS3.0    ");
+        buf.extend_from_slice(&ptr(text_start));
+        buf.extend_from_slice(&ptr(text_end));
+        buf.extend_from_slice(&ptr(data_start));
+        buf.extend_from_slice(&ptr(data_end));
+        buf.extend_from_slice(&ptr(analysis_start));
+        buf.extend_from_slice(&ptr(analysis_end));
+        buf.extend_from_slice(&text);
+        for i in 0..events {
+            for _ in 0..params {
+                buf.extend_from_slice(&(i as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn save_and_load_workspace_round_trips() {
+        let dir = std::path::Path::new("/tmp/opencode");
+        std::fs::create_dir_all(dir).unwrap();
+        let fcs_path = dir.join("ws_roundtrip.fcs");
+        write_fcs(&fcs_path, 4, 2);
+
+        let mut app = FlowersApp::default();
+        app.load_file(&fcs_path);
+        assert_eq!(app.samples.len(), 1);
+        app.push_gate(
+            "G1".into(),
+            GateKind::Rect {
+                x_min: 0.0,
+                x_max: 1.0,
+                y_min: 0.5,
+                y_max: 2.0,
+                angle: 0.25,
+            },
+            None,
+            0,
+            1,
+        );
+        app.selected_gate = Some(0);
+        app.view_mode = ViewMode::Contour;
+        app.contour_levels = 6;
+        app.x_range = (1.0, 3.0);
+        app.y_range = (2.0, 4.0);
+        app.layout_columns = 3;
+        app.add_layout_current();
+        assert_eq!(app.layout_panels.len(), 1);
+
+        let wsp = dir.join("ws_roundtrip.wsp");
+        app.save_workspace(&wsp);
+        assert!(wsp.exists());
+
+        let mut app2 = FlowersApp::default();
+        app2.load_workspace(&wsp);
+        assert_eq!(app2.samples.len(), 1);
+        assert_eq!(app2.samples[0].id, "ws_roundtrip.fcs");
+        assert!(app2.samples[0].path.ends_with("ws_roundtrip.fcs"));
+        assert_eq!(app2.gates.len(), 1);
+        assert_eq!(app2.gates[0].name, "G1");
+        assert_eq!(
+            app2.gates[0].kind,
+            GateKind::Rect {
+                x_min: 0.0,
+                x_max: 1.0,
+                y_min: 0.5,
+                y_max: 2.0,
+                angle: 0.25,
+            }
+        );
+        assert_eq!(app2.selected_gate, Some(0));
+        assert_eq!(app2.view_mode, ViewMode::Contour);
+        assert_eq!(app2.contour_levels, 6);
+        assert_eq!(app2.x_range, (1.0, 3.0));
+        assert_eq!(app2.y_range, (2.0, 4.0));
+        assert_eq!(app2.layout_columns, 3);
+        assert_eq!(app2.layout_panels.len(), 1);
+        assert_eq!(app2.layout_panels[0].sample, 0);
+    }
+
+    #[test]
+    fn bilinear_gate_selects_region_under_line() {
+        // Horizontal line at y=5 spanning x in [0, 10].
+        let kind = GateKind::Bilinear {
+            x1: 0.0,
+            y1: 5.0,
+            x2: 10.0,
+            y2: 5.0,
+            below: true,
+        };
+        let gate = kind.to_gate(0, 1);
+        let data = array![[1.0, 1.0], [1.0, 9.0], [20.0, 1.0], [5.0, 5.0]];
+        // (1,1) under the line & in band; (1,9) above; (20,1) outside band;
+        // (5,5) exactly on the line is included.
+        assert_eq!(gate.filter(&data), vec![0, 3]);
+    }
+
+    #[test]
+    fn bilinear_gate_follows_a_diagonal() {
+        // Line from (0,10) to (10,0): y = 10 - x.
+        let kind = GateKind::Bilinear {
+            x1: 0.0,
+            y1: 10.0,
+            x2: 10.0,
+            y2: 0.0,
+            below: true,
+        };
+        let gate = kind.to_gate(0, 1);
+        let data = array![[5.0, 4.0], [5.0, 6.0], [2.0, 1.0]];
+        // (5,4) below y=5 -> in; (5,6) above -> out; (2,1) below y=8 -> in.
+        assert_eq!(gate.filter(&data), vec![0, 2]);
+    }
+
+    #[test]
+    fn bilinear_polygon_spans_the_window_height() {
+        let kind = GateKind::Bilinear {
+            x1: 2.0,
+            y1: 5.0,
+            x2: 8.0,
+            y2: 5.0,
+            below: true,
+        };
+        let poly = kind.polygon((0.0, 10.0), (0.0, 10.0));
+        // Top edge is the line; the fill drops to the bottom of the Y axis.
+        assert_eq!(poly[0], [2.0, 5.0]);
+        assert_eq!(poly[1], [8.0, 5.0]);
+        assert_eq!(poly[2], [8.0, 0.0]);
+        assert_eq!(poly[3], [2.0, 0.0]);
     }
 }

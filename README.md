@@ -11,18 +11,23 @@
 |---------|-------------|
 | **FCS parsing** | FCS 2.0 / 3.0 / 3.1 listmode files (32-bit float and 64-bit double data, little/big-endian) |
 | **Compensation** | Spillover-matrix compensation from CSV matrices |
-| **Gating** | Rectangular, elliptical, polygonal, quadrant, bilinear, and boolean (AND/OR/NOT) gates |
+| **Gating** | Rectangular, elliptical, polygonal, quadrant, bilinear (line) and boolean (AND/OR/NOT) gates |
 | **Drag-to-create gates** | Draw gates directly on the scatter plot; click to place quadrant/bilinear gates |
+| **Line (bilinear) gate** | Draw a line; the events under it are gated, forming a full-height region the width of the line |
 | **Gate manipulation** | Rotate, enlarge, shrink, or move a gate after drawing it — via drag handles or nudge buttons |
 | **Statistics** | Count, %, mean, median, SD, CV, geometric MFI, min, max per population |
 | **Visualization** | SVG dot plots, 1D histograms, density gradients, and topographic contour views |
-| **Axis control** | Per-axis linear/log scales, editable ranges, and one-click auto-fit |
+| **Axis control** | Per-axis linear/log scales, editable ranges (scientific-notation display, proportional drag speed, type `1e7`), and one-click auto-fit |
+| **Smart default axes** | New files open on FSC-H vs SSC-H (or the best FSC/SSC match) automatically |
 | **Gate hierarchy** | FlowJo-style population tree with counts and percentages |
-| **Cross-sample gating** | Apply the same gate set to every loaded FCS file |
+| **Cross-sample gating** | Apply the same gate set to every loaded FCS file, with a per-file prompt |
+| **Undo / Redo** | `Ctrl+Z` / `Ctrl+Shift+Z` across gating, view settings and the layout editor |
+| **Workspaces** | Save / load a `.wsp` project (file list + gates + view + layout) from the File menu |
 | **Detached population window** | Pop a population into its own window with the full plotting/gating toolkit |
 | **Themes** | Switch the whole application between a dark and light theme |
 | **CSV reports** | Export per-population counts, percentages, and gate summaries |
 | **Layout editor** | Drag, resize, reorder and preview plots on a free-form canvas, then export |
+| **Axis label styling** | Rotate, resize, recolour, re-font, or rename each panel's axis labels |
 | **Figure export** | Export single plots or composed layouts as SVG, PNG, JPEG, or TIFF |
 | **Histogram view** | 1D histogram (counts view) of the X-axis channel |
 | **Per-gate apply control** | Toggle whether each gate applies to all samples or only its owner |
@@ -56,10 +61,12 @@ cargo build --release
 cargo run --bin flowers-gui --release
 ```
 
-1. Click **Load FCS File** (or use **File ▸ Load FCS** from the top menu).
-2. Select **X** and **Y** parameters from the dropdowns (human-readable names like "FITC-H", "PE-A").
+1. Click **Load FCS File** (or use **File ▸ Load FCS** from the top menu). The axes
+   default to **FSC-H vs SSC-H** when those channels exist.
+2. Override the **X** and **Y** parameters from the dropdowns (human-readable names like "FITC-H", "PE-A").
 3. **Drag on the scatter plot** to create a gate, or click **+ Add Gate**. Use the
    **New gate type** selector to draw rectangles, ellipses, polygons, quadrants, or bilinear gates.
+   A **bilinear** gate is a line gate: it selects the events **under** the line you draw.
 4. Open **Axis options** to set each axis to linear/log, edit the X/Y ranges, or hit
    **Auto** to fit the axis to the data.
 5. Open **Point & view options** to change the dot colour, enable **density gradient**
@@ -72,10 +79,16 @@ cargo run --bin flowers-gui --release
    colour, view and gating controls.
 7. Use **File ▸ Export SVG** / **File ▸ Export Image…** for a single plot, and **File ▸ Export CSV** for
    population counts and percentages across every loaded sample. Switch between the
-   **Dark** and **Light** themes from **Settings ▸ Theme**.
+   **Dark** and **Light** themes from **Settings ▸ Theme**. When you load a new file while
+   gates exist, a prompt asks whether to apply the current gating strategy to it; each
+   sample also has a **gates** checkbox in the sample list.
 8. Add panels in the **Layout editor** (from the top menu) and drag, resize and
-   reorder plots on a live canvas before exporting the composed figure as **SVG** or a
-   raster image (**PNG / JPEG / TIFF**).
+   reorder plots on a live canvas. Select a panel to **rotate, resize, recolour,
+   re-font, or rename its axis labels** before exporting the composed figure as
+   **SVG** or a raster image (**PNG / JPEG / TIFF**).
+9. **Undo** edits with `Ctrl+Z` and **redo** with `Ctrl+Shift+Z` (or the **Edit**
+   menu). Save your analysis with **File ▸ Save Workspace…** and reopen it later
+   with **File ▸ Load Workspace…**; the FCS files are re-read automatically.
 
 ### CLI
 
@@ -135,6 +148,7 @@ flowers/
 │   ├── layout.rs       # Layout editor: compose plots into one figure
 │   ├── raster.rs       # Rasterise SVG figures to PNG / JPEG / TIFF
 │   ├── export.rs       # CSV reports of population counts and percentages
+│   ├── project.rs      # Workspace (.wsp) file format (save / load analysis)
 │   ├── workspace.rs    # Experiment workspace & population trees
 │   └── gui.rs          # egui desktop GUI
 ├── data/               # Example FCS files

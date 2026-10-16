@@ -82,6 +82,24 @@ pub struct PlotStyle {
     pub contour_levels: usize,
     /// Optional plot title.
     pub title: String,
+    /// Font size (in SVG units) of the X-axis label.
+    pub x_label_size: f32,
+    /// Font size (in SVG units) of the Y-axis label.
+    pub y_label_size: f32,
+    /// Rotation of the X-axis label, in degrees (clockwise).
+    pub x_label_rotation: f32,
+    /// Rotation of the Y-axis label, in degrees (clockwise).
+    pub y_label_rotation: f32,
+    /// CSS font family used for the plot title.
+    pub label_font: String,
+    /// CSS font family used for the X-axis label.
+    pub x_label_font: String,
+    /// CSS font family used for the Y-axis label.
+    pub y_label_font: String,
+    /// Font size (in SVG units) of the plot title.
+    pub title_size: f32,
+    /// When false, the `(linear)` / `(log10)` suffix is omitted from axis labels.
+    pub show_scale_labels: bool,
 }
 
 impl Default for PlotStyle {
@@ -102,6 +120,15 @@ impl Default for PlotStyle {
             contour: false,
             contour_levels: 8,
             title: String::new(),
+            x_label_size: 12.0,
+            y_label_size: 12.0,
+            x_label_rotation: 0.0,
+            y_label_rotation: -90.0,
+            label_font: "sans-serif".to_string(),
+            x_label_font: "sans-serif".to_string(),
+            y_label_font: "sans-serif".to_string(),
+            title_size: 14.0,
+            show_scale_labels: true,
         }
     }
 }
@@ -127,6 +154,25 @@ fn svg_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Builds an axis label, optionally appending the `(linear)` / `(log10)` suffix.
+fn label_with_scale(label: &str, scale: AxisScale, show_scale: bool) -> String {
+    if show_scale {
+        format!("{} ({})", label, scale.label())
+    } else {
+        label.to_string()
+    }
+}
+
+/// An SVG `transform="rotate(...)"` attribute about `(x, y)`, or an empty string
+/// when the rotation is effectively zero.
+fn rotation_attr(deg: f32, (x, y): (f64, f64)) -> String {
+    if deg.abs() < 1e-6 {
+        String::new()
+    } else {
+        format!(" transform=\"rotate({deg} {x},{y})\"")
+    }
+}
+
 /// Formats an axis tick value for display given an axis scale.
 ///
 /// Large values are rendered in scientific notation (e.g. `7e4` for 70000) so
@@ -143,16 +189,17 @@ pub fn format_tick(v: f64, scale: AxisScale) -> String {
     if abs >= 1000.0 || (abs > 0.0 && abs < 0.01) {
         // Scientific notation: one significant digit, strip trailing ".0".
         let mut s = format!("{value:.1e}");
-        // "7.0e4" -> "7e4", "7.5e4" stays "7.5e4".
+        // "7.0e4" -> "7e4", "7.5e4" stays "7.5e4". Replace the whole ".0e"
+        // run so the exponent marker is not duplicated.
         if let Some(pos) = s.find(".0e") {
-            s.replace_range(pos..pos + 2, "e");
+            s.replace_range(pos..pos + 3, "e");
         }
         // Normalise exponent: "7e+04" -> "7e4".
         if let Some(e_pos) = s.find('e') {
             let rest = &s[e_pos + 1..];
             let normalized = rest.trim_start_matches('+').trim_start_matches('0');
             let normalized = if normalized.is_empty() { "0" } else { normalized };
-            s = format!("{}e{}", &s[..=e_pos], normalized);
+            s = format!("{}e{}", &s[..e_pos], normalized);
         }
         s
     } else if abs >= 100.0 {
@@ -276,8 +323,10 @@ pub fn dot_plot_svg(
     // Title.
     if !style.title.is_empty() {
         svg.push_str(&format!(
-            "<text x=\"{}\" y=\"22\" font-size=\"14\" font-weight=\"bold\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
+            "<text x=\"{}\" y=\"22\" font-family=\"{}\" font-size=\"{}\" font-weight=\"bold\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
             style.width as f64 / 2.0,
+            svg_escape(&style.label_font),
+            style.title_size,
             style.text_color,
             svg_escape(&style.title)
         ));
@@ -285,19 +334,29 @@ pub fn dot_plot_svg(
 
     let y_center = origin_y - plot_h / 2.0;
     // Axis labels.
+    let x_anchor = (origin_x + plot_w / 2.0, style.height as f64 - 10.0);
+    let y_anchor = (15.0_f64, y_center);
+    let x_text = label_with_scale(x_label, style.x_scale, style.show_scale_labels);
+    let y_text = label_with_scale(y_label, style.y_scale, style.show_scale_labels);
     svg.push_str(&format!(
-        "<text x=\"{}\" y=\"{}\" font-size=\"12\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
-        origin_x + plot_w / 2.0,
-        style.height as f64 - 10.0,
+        "<text x=\"{}\" y=\"{}\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\" text-anchor=\"middle\"{}>{}</text>\n",
+        x_anchor.0,
+        x_anchor.1,
+        svg_escape(&style.x_label_font),
+        style.x_label_size,
         style.text_color,
-        svg_escape(&format!("{} ({})", x_label, style.x_scale.label()))
+        rotation_attr(style.x_label_rotation, x_anchor),
+        svg_escape(&x_text)
     ));
     svg.push_str(&format!(
-        "<text x=\"15\" y=\"{}\" font-size=\"12\" fill=\"{}\" text-anchor=\"middle\" transform=\"rotate(-90 15,{})\">{}</text>\n",
-        y_center,
+        "<text x=\"{}\" y=\"{}\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\" text-anchor=\"middle\"{}>{}</text>\n",
+        y_anchor.0,
+        y_anchor.1,
+        svg_escape(&style.y_label_font),
+        style.y_label_size,
         style.text_color,
-        y_center,
-        svg_escape(&format!("{} ({})", y_label, style.y_scale.label()))
+        rotation_attr(style.y_label_rotation, y_anchor),
+        svg_escape(&y_text)
     ));
 
     // Tick labels.
@@ -416,10 +475,15 @@ pub fn dot_plot_svg(
 }
 
 /// Renders a 1D histogram for a single parameter over a set of events.
+///
+/// `label` is the X-axis label; `y_label` is the Y-axis label (use `"Count"`
+/// for the default). Axis-label font/rotation/size come from `style`.
+#[allow(clippy::too_many_arguments)]
 pub fn histogram_svg(
     data: &ndarray::Array2<f32>,
     param_idx: usize,
     label: &str,
+    y_label: &str,
     indices: &[usize],
     value_range: Option<(f32, f32)>,
     bins: usize,
@@ -497,16 +561,29 @@ pub fn histogram_svg(
     }
 
     let y_center = origin_y - plot_h / 2.0;
+    let x_anchor = (origin_x + plot_w / 2.0, style.height as f32 - 10.0);
+    let y_anchor = (15.0_f64, y_center as f64);
+    let x_text = label_with_scale(label, style.x_scale, style.show_scale_labels);
+    let y_text = if y_label.is_empty() { "Count" } else { y_label };
     svg.push_str(&format!(
-        "<text x=\"{}\" y=\"{}\" font-size=\"12\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
-        origin_x + plot_w / 2.0,
-        style.height as f32 - 10.0,
+        "<text x=\"{}\" y=\"{}\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\" text-anchor=\"middle\"{}>{}</text>\n",
+        x_anchor.0,
+        x_anchor.1,
+        svg_escape(&style.x_label_font),
+        style.x_label_size,
         style.text_color,
-        svg_escape(&format!("{} ({})", label, style.x_scale.label()))
+        rotation_attr(style.x_label_rotation, (x_anchor.0 as f64, x_anchor.1 as f64)),
+        svg_escape(&x_text)
     ));
     svg.push_str(&format!(
-        "<text x=\"15\" y=\"{}\" font-size=\"12\" fill=\"{}\" text-anchor=\"middle\" transform=\"rotate(-90 15,{})\">Count</text>\n",
-        y_center, style.text_color, y_center
+        "<text x=\"{}\" y=\"{}\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\" text-anchor=\"middle\"{}>{}</text>\n",
+        y_anchor.0,
+        y_anchor.1,
+        svg_escape(&style.y_label_font),
+        style.y_label_size,
+        style.text_color,
+        rotation_attr(style.y_label_rotation, y_anchor),
+        svg_escape(y_text)
     ));
 
     // Tick labels.
@@ -852,6 +929,22 @@ mod tests {
     use ndarray::array;
 
     #[test]
+    fn format_tick_uses_compact_scientific_notation() {
+        // Regression: the exponent marker used to be duplicated ("7eee4").
+        assert_eq!(format_tick(70000.0, AxisScale::Linear), "7e4");
+        assert_eq!(format_tick(1_000_000.0, AxisScale::Linear), "1e6");
+        assert_eq!(format_tick(1e7, AxisScale::Linear), "1e7");
+        assert_eq!(format_tick(5_300_871.0, AxisScale::Linear), "5.3e6");
+        assert_eq!(format_tick(-70000.0, AxisScale::Linear), "-7e4");
+        assert_eq!(format_tick(1e-3, AxisScale::Linear), "1e-3");
+        // Log scale receives the exponent and raises it back.
+        assert_eq!(format_tick(6.0, AxisScale::Log), "1e6");
+        // Small / mid values stay in plain notation.
+        assert_eq!(format_tick(123.0, AxisScale::Linear), "123");
+        assert_eq!(format_tick(1.5, AxisScale::Linear), "1.50");
+    }
+
+    #[test]
     fn dot_plot_svg_renders() {
         let data = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
         let svg = dot_plot_svg(
@@ -907,7 +1000,7 @@ mod tests {
     #[test]
     fn histogram_svg_renders() {
         let data = array![[1.0], [2.0], [2.0], [3.0]];
-        let svg = histogram_svg(&data, 0, "FSC", &[], None, 10, &PlotStyle::default());
+        let svg = histogram_svg(&data, 0, "FSC", "Count", &[], None, 10, &PlotStyle::default());
         assert!(svg.contains("<svg"));
         assert!(svg.contains("FSC"));
         assert!(svg.contains("<rect"));

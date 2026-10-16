@@ -246,6 +246,7 @@ fn run(command: Commands) -> Result<(), anyhow::Error> {
                 &fcs_file.data,
                 p,
                 &name,
+                "Count",
                 &[],
                 None,
                 30,

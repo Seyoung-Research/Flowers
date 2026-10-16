@@ -341,6 +341,88 @@ impl Gate for BilinearGate {
 }
 
 // ---------------------------------------------------------------------------
+// Line gate (one side of a line segment, restricted to its horizontal extent)
+// ---------------------------------------------------------------------------
+
+/// A line gate selects the events on one side of a straight line segment,
+/// restricted to the segment's horizontal extent. This is the "region under the
+/// line" shape used by the GUI's bilinear/line gate: a point is inside when its
+/// X lies between the segment's endpoints and its Y is below (or above) the
+/// segment at that X.
+///
+/// The gate is unbounded in the Y direction, so it stays meaningful no matter
+/// how the plot window is later zoomed or panned. Renderers clip the visible
+/// fill to the current axis range, which is what makes it look like a
+/// full-height rectangle on screen.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LineGate {
+    pub param_idx_x: usize,
+    pub param_idx_y: usize,
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    /// When true, events below the line (`y <= line_y(x)`) are selected;
+    /// when false, events above the line are selected.
+    pub below: bool,
+}
+
+impl LineGate {
+    pub fn new(
+        x: usize,
+        y: usize,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        below: bool,
+    ) -> Self {
+        Self {
+            param_idx_x: x,
+            param_idx_y: y,
+            x1,
+            y1,
+            x2,
+            y2,
+            below,
+        }
+    }
+
+    /// Y value of the line at `x` (works for any non-vertical orientation).
+    fn line_y(&self, x: f32) -> f32 {
+        let dx = self.x2 - self.x1;
+        if dx.abs() < 1e-9 {
+            (self.y1 + self.y2) / 2.0
+        } else {
+            self.y1 + (self.y2 - self.y1) * (x - self.x1) / dx
+        }
+    }
+}
+
+impl Gate for LineGate {
+    fn contains(&self, event: ArrayView1<f32>) -> bool {
+        let x = event[self.param_idx_x];
+        let y = event[self.param_idx_y];
+        let xa = self.x1.min(self.x2);
+        let xb = self.x1.max(self.x2);
+        // A (near-)vertical segment has no meaningful X extent; fall back to an
+        // unbounded half-plane threshold at the segment's midpoint.
+        if (xb - xa).abs() > 1e-9 && (x < xa || x > xb) {
+            return false;
+        }
+        let line_y = self.line_y(x);
+        if self.below {
+            y <= line_y
+        } else {
+            y >= line_y
+        }
+    }
+    fn parameter_indices(&self) -> Vec<usize> {
+        vec![self.param_idx_x, self.param_idx_y]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Boolean gate (compose gates with AND / OR / NOT)
 // ---------------------------------------------------------------------------
 
@@ -559,6 +641,24 @@ mod tests {
         let mut union: Vec<usize> = all.iter().flatten().copied().collect();
         union.sort_unstable();
         assert_eq!(union, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn line_gate_selects_region_under_a_diagonal() {
+        let data = sample_data();
+        // Line from (0,5) to (10,5): a horizontal threshold at y=5 spanning x in [0,10].
+        let below = LineGate::new(0, 1, 0.0, 5.0, 10.0, 5.0, true);
+        let idx = below.filter(&data);
+        // Events with y <= 5: [1,1], [2,2], [8,1], [9,2].
+        assert_eq!(idx, vec![0, 1, 2, 3]);
+
+        let above = LineGate::new(0, 1, 0.0, 5.0, 10.0, 5.0, false);
+        let idx = above.filter(&data);
+        assert_eq!(idx, vec![4, 5]);
+
+        // The X extent is respected: restrict the line to x in [0,5].
+        let narrow = LineGate::new(0, 1, 0.0, 5.0, 5.0, 5.0, true);
+        assert_eq!(narrow.filter(&data), vec![0, 1]);
     }
 
     #[test]

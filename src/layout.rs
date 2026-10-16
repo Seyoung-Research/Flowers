@@ -1,9 +1,12 @@
 //! Layout editor: compose several rendered plots into one image/export.
 //!
 //! Each panel is a self-contained SVG document (as produced by
-//! [`crate::plot::dot_plot_svg`]). [`render_layout`] arranges them in a grid and
-//! nests each panel inside the composite SVG with an offset and a title, which
-//! is how the GUI's "layout editor" exports multi-plot figures.
+//! [`crate::plot::dot_plot_svg`]). [`render_layout`] arranges them in a grid,
+//! and [`render_layout_free`] places them at arbitrary positions and sizes; both
+//! inline each panel's contents into a `<g>` with a title. Inlining (rather than
+//! nesting `<svg>` documents) keeps the output portable across SVG viewers, and
+//! text always carries an explicit font family so raster exports do not fall
+//! back to a mismatched font.
 
 /// A single panel in a layout: a title and a pre-rendered SVG document.
 #[derive(Debug, Clone, Default)]
@@ -24,6 +27,9 @@ pub struct LayoutOptions {
     pub padding: u32,
     pub background: String,
     pub text_color: String,
+    /// Font family used for panel titles (also carried into raster exports so
+    /// text does not fall back to a mismatched font).
+    pub font_family: String,
 }
 
 impl Default for LayoutOptions {
@@ -36,6 +42,7 @@ impl Default for LayoutOptions {
             padding: 12,
             background: "#ffffff".to_string(),
             text_color: "#222222".to_string(),
+            font_family: "sans-serif".to_string(),
         }
     }
 }
@@ -47,18 +54,19 @@ fn svg_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Re-emits an SVG document positioned at `(x, y)` inside a parent SVG.
-fn nest_svg(svg: &str, x: f64, y: f64) -> String {
-    // The document always begins with an `<svg ` open tag.
-    if let Some(idx) = svg.find("<svg ") {
-        let mut out = String::with_capacity(svg.len() + 32);
-        out.push_str(&svg[..idx]);
-        out.push_str(&format!("<svg x=\"{x}\" y=\"{y}\" "));
-        out.push_str(&svg[idx + 5..]);
-        out
-    } else {
-        svg.to_string()
-    }
+/// Returns the markup *inside* an SVG document — everything after the opening
+/// `<svg ...>` tag and before the final `</svg>`.
+///
+/// Panel documents are inlined into a `<g>` rather than nested inside another
+/// `<svg>`, which avoids problems some SVG viewers have with nested viewports
+/// (a reported cause of "missing plots" in exported layouts).
+fn svg_inner(svg: &str) -> &str {
+    let start = match svg.find('>') {
+        Some(i) => i + 1,
+        None => return "",
+    };
+    let end = svg.rfind("</svg>").unwrap_or(svg.len());
+    &svg[start..end.max(start).min(svg.len())]
 }
 
 /// Arranges panels in a grid and returns a composite SVG document.
@@ -92,19 +100,26 @@ pub fn render_layout(panels: &[LayoutPanel], opts: &LayoutOptions) -> String {
 
         // Title.
         svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"13\" font-weight=\"bold\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"{}\" font-size=\"13\" font-weight=\"bold\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
             cx + opts.cell_width as f64 / 2.0,
             cy + 18.0,
+            opts.font_family,
             opts.text_color,
             svg_escape(&panel.title)
         ));
 
-        // Nested panel, offset below the title.
-        let nested = nest_svg(&panel.svg, cx, cy + opts.title_height as f64);
-        svg.push_str(&nested);
-        if !nested.ends_with('\n') {
+        // Inlined panel, offset below the title.
+        let inner = svg_inner(&panel.svg);
+        svg.push_str(&format!(
+            "<g transform=\"translate({:.2},{:.2})\">\n",
+            cx,
+            cy + opts.title_height as f64
+        ));
+        svg.push_str(inner);
+        if !inner.ends_with('\n') {
             svg.push('\n');
         }
+        svg.push_str("</g>\n");
     }
 
     svg.push_str("</svg>\n");
@@ -130,7 +145,7 @@ pub struct LayoutPlacement {
 
 /// Composes freely-placed panels into a single SVG canvas.
 ///
-/// Each panel's SVG is nested and scaled to fit its `width`/`height`, with its
+/// Each panel's SVG is inlined and scaled to fit its `width`/`height`, with its
 /// title drawn above it.
 pub fn render_layout_free(
     canvas_width: u32,
@@ -153,9 +168,10 @@ pub fn render_layout_free(
     for p in placements {
         // Title above the panel.
         svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"13\" font-weight=\"bold\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"{}\" font-size=\"13\" font-weight=\"bold\" fill=\"{}\" text-anchor=\"middle\">{}</text>\n",
             p.x as f64 + p.width as f64 / 2.0,
             p.y as f64 + 12.0,
+            opts.font_family,
             opts.text_color,
             svg_escape(&p.title)
         ));
@@ -171,9 +187,9 @@ pub fn render_layout_free(
             sx,
             sy
         ));
-        let nested = nest_svg(&p.svg, 0.0, 0.0);
-        svg.push_str(&nested);
-        if !nested.ends_with('\n') {
+        let inner = svg_inner(&p.svg);
+        svg.push_str(inner);
+        if !inner.ends_with('\n') {
             svg.push('\n');
         }
         svg.push_str("</g>\n");
@@ -190,7 +206,7 @@ mod tests {
     use crate::plot::{dot_plot_svg, PlotStyle};
 
     #[test]
-    fn render_layout_nests_panels() {
+    fn render_layout_inlines_panels() {
         let data = array![[1.0, 2.0], [3.0, 4.0]];
         let panel = dot_plot_svg(
             &data,
@@ -218,7 +234,12 @@ mod tests {
         assert!(out.starts_with("<svg"));
         assert!(out.contains("Sample 1"));
         assert!(out.contains("Sample 2"));
-        assert!(out.matches("<svg").count() >= 3); // outer + 2 nested
+        // A single outer <svg>; panel content is inlined into <g> groups.
+        assert_eq!(out.matches("<svg").count(), 1);
+        assert_eq!(out.matches("<g ").count(), 2);
+        // Titles carry a font family so raster export picks a sane font.
+        assert!(out.contains("font-family=\"sans-serif\""));
+        assert!(!out.contains("<svg x="));
     }
 
     #[test]
@@ -247,5 +268,6 @@ mod tests {
         assert!(out.contains("translate(30.00,68.00)"));
         assert!(out.contains("scale(0.6000,0.5778)"));
         assert!(out.contains("Sample 1"));
+        assert_eq!(out.matches("<svg").count(), 1);
     }
 }

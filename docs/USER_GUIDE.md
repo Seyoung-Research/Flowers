@@ -17,17 +17,20 @@ written in Rust. This guide explains how to use the graphical user interface
    - [Gate Types](#gate-types)
    - [Manipulating Gates](#manipulating-gates)
    - [Polygon Vertices](#polygon-vertices)
-   - [Bilinear Gates (Horizontal Threshold)](#bilinear-gates-horizontal-threshold)
+   - [Bilinear / Line Gate (Region Under a Line)](#bilinear--line-gate-region-under-a-line)
 5. [Gate Hierarchy & Tree](#gate-hierarchy--tree)
 6. [Detached Population Windows](#detached-population-windows)
 7. [Themes](#themes)
-8. [Apply Gates to All Files](#apply-gates-to-all-files)
-9. [Export](#export)
-   - [SVG Export](#svg-export)
-   - [Raster Image Export (PNG/JPEG/TIFF)](#raster-image-export-pngjpegtiff)
-   - [CSV Export](#csv-export)
-10. [Layout Editor](#layout-editor)
-11. [Command-Line Interface](#command-line-interface)
+8. [Undo / Redo](#undo--redo)
+9. [Applying Gates Across Files](#applying-gates-across-files)
+10. [Export](#export)
+    - [SVG Export](#svg-export)
+    - [Raster Image Export (PNG/JPEG/TIFF)](#raster-image-export-pngjpegtiff)
+    - [CSV Export](#csv-export)
+11. [Layout Editor](#layout-editor)
+    - [Axis Label Styling](#axis-label-styling)
+12. [Workspaces](#workspaces)
+13. [Command-Line Interface](#command-line-interface)
 
 ---
 
@@ -57,11 +60,19 @@ Example FCS files are provided in `data/`:
 1. Click **"Load FCS File"** in the left sidebar, or use **File ▸ Load FCS** from
    the top menu bar.
 2. Select one or more `.fcs` files (FCS 2.0 / 3.0 / 3.1).
-3. After loading, select **X** and **Y** parameters from the dropdowns in the
-   left sidebar. Human-readable names (e.g. "FITC-H", "PE-A") are shown where
+3. When a file loads, the X and Y axes are chosen automatically:
+   - **X = FSC-H**, **Y = SSC-H** when those channels are present.
+   - Otherwise the first FSC/SSC channel (FSC-A/SSC-A) is used, falling back to
+     the first two parameters.
+4. You can override the axes at any time with the **X** and **Y** dropdowns in
+   the left sidebar. Human-readable names (e.g. "FITC-H", "PE-A") are shown where
    available.
 
-The scatter plot appears in the central panel once X and Y are selected.
+The scatter plot appears in the central panel as soon as a file is loaded.
+
+If gates already exist when you load a new file, a prompt asks whether to apply
+the current gating strategy to that file — see
+[Applying Gates Across Files](#applying-gates-across-files).
 
 ---
 
@@ -72,11 +83,18 @@ The scatter plot appears in the central panel once X and Y are selected.
 Open **Axis options** in the left sidebar:
 
 - **X scale / Y scale**: Choose **Linear** or **Log** (base-10).
-- **X range / Y range**: Drag the min/max values to set the visible window.
+- **X range / Y range**: Set the visible window.
+  - Large values are shown in **scientific notation** (e.g. `5.300871e6`) so
+    10⁷-scale numbers stay short and readable.
+  - **Drag** a value to change it — the drag speed scales with the axis width,
+    so a 10⁷-wide axis can be swept in a single drag instead of one unit per
+    pixel.
+  - **Click** a value to type an exact number. Both plain (`250000`) and
+    scientific (`2.5e5`, `1e7`) input are accepted.
 - **Auto**: Click **Auto** next to an axis to fit it to the data.
 
-Axis tick labels use scientific notation for large values (e.g. `7e4` instead of
-`70000`) so they do not collide with the axis title.
+Axis tick labels use compact scientific notation for large values (e.g. `7e4`
+instead of `70000`) so they do not collide with the axis title.
 
 ### Dot Colour, Gradient & View
 
@@ -109,11 +127,16 @@ This view is available in both the main window and detached population windows.
 1. Choose a **New gate type** from the radio buttons in the left sidebar:
    Rectangle, Ellipse, Polygon, Quadrant, or Bilinear.
 2. **Drag on the scatter plot** to draw the gate.
-3. For **Quadrant** and **Bilinear** gates, you can also **click** on the plot to
-   place the gate at that position.
+   - For **Bilinear**, the drag *is* the line: the gate is the region under the
+     line you draw (see below).
+3. For **Quadrant** and **Bilinear** gates you can also **click** on the plot to
+   place the gate at that position (a quadrant crosshair, or a horizontal line).
 4. Click **+ Add Gate** to create a gate at the centre of the current view.
 5. Gates appear in the **Gate tree** on the right side. Select a gate to edit
    its name, colour, geometry, and parent.
+
+While dragging, a preview shows the shape being drawn (a rectangle, ellipse,
+polygon, or — for Bilinear — the dividing line).
 
 ### Gate Types
 
@@ -123,7 +146,7 @@ This view is available in both the main window and detached population windows.
 | **Ellipse** | Oval gate (can be rotated and stretched per axis). |
 | **Polygon** | Free-form polygon with 3+ vertices. |
 | **Quadrant** | Four-way split by vertical and horizontal lines. |
-| **Bilinear** | Horizontal threshold line creating "Below" and "Above" gates. |
+| **Bilinear** | Line gate: selects the events **under** a line you draw, within the line's width. |
 
 ### Manipulating Gates
 
@@ -135,7 +158,8 @@ You can manipulate it in two ways:
 - **Corner handles** (white squares on rectangles; on the ellipse edge for ellipses; vertices for polygons): drag to resize/scale.
 - **Edge handles** (ellipses only, at left/top/right/bottom): drag to stretch one axis.
 - **Diamond handle** (rotate): drag to rotate about the centre.
-- **Cross handle** (centre, bilinear only): drag to move the split point.
+- **Centre handle** (quadrant and bilinear): drag to move the split point / line.
+- **Line-end handles** (bilinear): drag either endpoint to reshape the line.
 - **Body**: drag anywhere inside the gate to move it.
 
 The mouse cursor changes to indicate the handle type (resize arrows, grab hand,
@@ -155,16 +179,28 @@ For polygon gates, you can add or remove vertices:
 - **+ Add vertex**: inserts a new vertex at the midpoint of the longest edge.
 - **− Remove vertex**: removes the last vertex (minimum 3 vertices enforced).
 
-### Bilinear Gates (Horizontal Threshold)
+### Bilinear / Line Gate (Region Under a Line)
 
-Bilinear gates now draw a **horizontal threshold line**. Dragging horizontally
-creates two gates:
+The bilinear gate is a **line gate**. Instead of splitting the whole window, a
+single gate is created from the line you draw:
 
-- **Below**: events with Y value below the line.
-- **Above**: events with Y value above the line.
+- **Drag** across the plot to draw a line. The gate is the region **under** that
+  line — a shape whose top edge follows the line, whose width matches the
+  horizontal extent of the line you drew, and whose sides drop down to the
+  bottom of the Y axis (so it looks like a full-height rectangle when the line
+  is horizontal).
+- **Click** on the plot to place a horizontal threshold line at that Y value.
+- **+ Add Gate** places a horizontal threshold across the current view.
 
-Clicking on the plot places the horizontal line at that Y position. You can
-rotate or move the threshold line using the handles or transform buttons.
+Because the gate hugs the drawn line, a diagonal line selects a diagonal band of
+events. Draw a nearly-vertical line to make a left/right split (the two sides are
+then treated as a threshold at the line's midpoint).
+
+In the gate editor you can:
+
+- Edit the line's **Start X/Y** and **End X/Y** numerically.
+- Toggle **"Select points below the line"** — uncheck it to select the region
+  **above** the line instead.
 
 ---
 
@@ -200,6 +236,8 @@ The detached window has the full plotting and gating toolkit:
 - Dots / Contour / Histogram view
 - Gate drawing and manipulation on the population
 - All transform buttons
+- An **Add this plot to layout** button that sends the detached view straight
+  into the [Layout Editor](#layout-editor)
 
 Close the window to return to the main view.
 
@@ -216,18 +254,64 @@ The entire application (plot, panels, text) updates immediately.
 
 ---
 
-## Apply Gates to All Files
+## Undo / Redo
 
-By default, gates apply to **all loaded FCS files**. You can control this per
-gate:
+Every edit to the analysis can be undone and redone:
 
-1. Select a gate in the tree.
-2. In the bottom gate editor, toggle **"Apply to all samples"**.
-   - **Checked** (default): the gate is evaluated for every loaded sample.
-   - **Unchecked**: the gate applies only to the sample it was created on
-     (shown as the "owner sample" next to the checkbox).
-3. The cross-sample table and CSV export only include gates that apply to each
-   sample.
+- **Undo**: `Ctrl + Z` (⌘Z on macOS), or **Edit ▸ Undo**.
+- **Redo**: `Ctrl + Shift + Z` or `Ctrl + Y` (⌘⇧Z / ⌘Y on macOS), or
+  **Edit ▸ Redo**.
+
+Undo covers the **gating strategy**, the **view settings** (axes, scales,
+ranges, colours, view mode) and the **layout editor** contents. Loaded FCS files
+are inputs and are *not* undone — undoing never unloads a file.
+
+A whole drag (drawing a gate, moving a handle, dragging an axis value) collapses
+into a **single** undo step, so one `Ctrl + Z` reverses the entire gesture. The
+history keeps the most recent 200 steps.
+
+---
+
+## Applying Gates Across Files
+
+Gates can be shared across every file in your experiment, but **you decide** how
+they are applied — nothing is forced.
+
+### The per-file prompt
+
+When you load a new FCS file and gates already exist, a prompt appears:
+
+> **Apply the existing N gate(s) to this file?**
+
+- **Apply gates** — the current gating strategy is evaluated for the new file.
+- **Don't apply** — the new file keeps its own (empty) gate set for now.
+
+**How a gate is applied.** A gate is always evaluated for the sample it was
+*created* on. For any *other* sample it is evaluated only when the gate's
+**"Apply to all samples"** checkbox is on *and* that sample has gating enabled.
+
+### The per-sample checkbox
+
+Every entry in the **Loaded samples** list has a small **"gates"** checkbox:
+
+- **Checked**: the shared gate set applies to this file.
+- **Unchecked**: shared gates are skipped for this file (gates created on it
+  still apply).
+
+Toggle it at any time to add or remove a file from the gating strategy. Hover
+the checkbox for a reminder of what it does.
+
+### The per-gate checkbox
+
+For fine control, select a gate in the tree and use **"Apply to all samples"** in
+the gate editor:
+
+- **Checked** (default): the gate is evaluated for every file whose **gates**
+  checkbox is on.
+- **Unchecked**: the gate applies only to the sample it was created on (shown as
+  the "owner sample" next to the checkbox).
+
+The cross-sample table and CSV export respect both switches.
 
 ---
 
@@ -260,18 +344,71 @@ The layout editor lets you arrange plots on a free-form canvas (like
 Photoshop) before exporting a multi-panel figure.
 
 1. Click **Layout Editor** from the top menu bar.
-2. **Add current plot**: adds the main window's plot as a panel.
-3. **Add detached plot**: adds the current detached population window's view as
-   a panel (only available when a detached window is open).
-4. Drag panels to move them; drag the corner handle to resize.
-5. Use **Tile** to arrange panels in a grid, **Bring to front** to reorder, and
-   **Delete** to remove a panel.
-6. Export as **SVG…** or **Image…** (PNG/JPEG/TIFF).
+2. Add panels:
+   - **Add main plot**: adds the main window's plot as a panel.
+   - **Add detached plot**: adds the open detached population window's view.
+   - **Add this plot to layout** (inside a detached window): adds that
+     population's view without leaving the window.
+3. Drag panels to move them; drag the corner handle to resize.
+4. Use **Tile** to arrange panels in a grid, **Bring to front** to reorder, and
+   **Delete** to remove a panel. **Columns** controls how many columns **Tile**
+   uses.
+5. Export as **SVG…** or **Image…** (PNG/JPEG/TIFF).
 
 Each panel shows:
-- The plot title (Y-axis parameter name).
+
+- The plot title.
 - X and Y axis labels.
 - A preview of the data points.
+
+**Export notes.** Panels are written as inlined content inside a single SVG
+document (rather than nested `<svg>` viewports), which keeps every panel visible
+across SVG viewers. Panel titles carry an explicit font family, so text in
+PNG/JPEG/TIFF exports is rendered in a normal font instead of a substituted one.
+
+### Axis Label Styling
+
+Select a panel, then use the **Axis label style** controls below the canvas to
+style its X and Y labels independently:
+
+| Control | Effect |
+|---------|--------|
+| **X text / Y text** | Replace the label text. Leave blank to use the parameter name. |
+| **size** | Font size of the label. |
+| **rotate** | Rotation of the label, in degrees (−180…180). The Y label defaults to −90°. |
+| **font** | Font family: **Sans**, **Serif**, or **Mono**. |
+| **colour swatch** | Label colour. |
+
+The canvas preview updates immediately so you can see the result before
+exporting. The same styling is applied to the exported SVG and raster images.
+
+The `(linear)` / `(log10)` scale suffix is kept on each label; only the parameter
+name portion is replaced by your custom text.
+
+---
+
+## Workspaces
+
+A **workspace** (`.wsp`) saves your analysis so you can pick it up later. It
+stores the list of FCS file paths plus the gating strategy, view settings and
+layout editor contents — but **not** the raw event data (FCS files are large and
+usually live next to the workspace). The file is human-readable JSON.
+
+Use the **File** menu:
+
+| Item | Effect |
+|------|--------|
+| **New Workspace** | Clears all samples, gates and layout, and resets the view. The theme is kept. |
+| **Load Workspace…** | Opens a `.wsp` file and re-reads the referenced FCS files. |
+| **Save Workspace…** | Writes the current analysis to a `.wsp` file. |
+
+**Loading** restores the file list, gates (including hierarchy, colours and the
+per-gate "apply to all" flag), per-file "gates" checkboxes, axes/scales/ranges,
+dot colour, view mode, and every layout panel with its axis-label styling. If a
+referenced FCS file has moved or been deleted, it is skipped and reported in the
+status line; the rest of the workspace still loads.
+
+After loading, undo/redo starts fresh from the loaded state.
 
 ---
 
@@ -325,6 +462,7 @@ flowers/
 │   ├── export.rs       # CSV reports
 │   ├── statistics.rs   # Population statistics
 │   ├── compensation.rs # Spillover compensation
+│   ├── project.rs      # Workspace (.wsp) file format
 │   └── workspace.rs    # Experiment workspace
 ├── data/               # Example FCS files
 └── examples/           # Example programs

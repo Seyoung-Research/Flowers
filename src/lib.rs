@@ -17,6 +17,7 @@ pub mod gating;
 pub mod gui;
 pub mod layout;
 pub mod plot;
+pub mod project;
 pub mod raster;
 pub mod statistics;
 pub mod workspace;
@@ -25,7 +26,7 @@ pub use compensation::CompensationEngine;
 pub use export::{populations_csv, write_populations_csv, PopulationRow};
 pub use fcs::{FcsError, FcsFile, FcsParser, Parameter};
 pub use gating::{
-    BilinearGate, BooleanGate, EllipseGate, Gate, PolygonGate, Quadrant, QuadrantGate,
+    BilinearGate, BooleanGate, EllipseGate, Gate, LineGate, PolygonGate, Quadrant, QuadrantGate,
     RectangularGate,
 };
 pub use layout::{render_layout, render_layout_free, LayoutOptions, LayoutPanel, LayoutPlacement};
