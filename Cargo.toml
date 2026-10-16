@@ -26,6 +26,11 @@ egui = "0.29"
 egui_plot = "0.29"
 rfd = "0.14"
 
+# Raster image export (SVG -> PNG / JPEG / TIFF)
+resvg = "0.36"
+fontdb = "0.15"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "tiff"] }
+
 [dev-dependencies]
 approx = "0.5"
 

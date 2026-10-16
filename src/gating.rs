@@ -35,6 +35,9 @@ pub struct RectangularGate {
     pub max_x: f32,
     pub min_y: f32,
     pub max_y: f32,
+    /// Rotation of the rectangle about its centre, in radians.
+    #[serde(default)]
+    pub angle: f32,
 }
 
 impl RectangularGate {
@@ -46,7 +49,14 @@ impl RectangularGate {
             max_x,
             min_y,
             max_y,
+            angle: 0.0,
         }
+    }
+
+    /// Sets a rotation (radians) about the rectangle's centre.
+    pub fn with_angle(mut self, angle: f32) -> Self {
+        self.angle = angle;
+        self
     }
 }
 
@@ -54,7 +64,20 @@ impl Gate for RectangularGate {
     fn contains(&self, event: ArrayView1<f32>) -> bool {
         let x = event[self.param_idx_x];
         let y = event[self.param_idx_y];
-        x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
+        if self.angle == 0.0 {
+            return x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y;
+        }
+        let cx = (self.min_x + self.max_x) / 2.0;
+        let cy = (self.min_y + self.max_y) / 2.0;
+        let hw = (self.max_x - self.min_x) / 2.0;
+        let hh = (self.max_y - self.min_y) / 2.0;
+        let (s, c) = self.angle.sin_cos();
+        let dx = x - cx;
+        let dy = y - cy;
+        // Rotate the point into the rectangle's local frame.
+        let lx = dx * c + dy * s;
+        let ly = -dx * s + dy * c;
+        lx.abs() <= hw && ly.abs() <= hh
     }
     fn parameter_indices(&self) -> Vec<usize> {
         vec![self.param_idx_x, self.param_idx_y]
@@ -73,6 +96,9 @@ pub struct EllipseGate {
     pub center_y: f32,
     pub radius_x: f32,
     pub radius_y: f32,
+    /// Rotation of the ellipse about its centre, in radians.
+    #[serde(default)]
+    pub angle: f32,
 }
 
 impl EllipseGate {
@@ -84,7 +110,14 @@ impl EllipseGate {
             center_y,
             radius_x,
             radius_y,
+            angle: 0.0,
         }
+    }
+
+    /// Sets a rotation (radians) about the ellipse's centre.
+    pub fn with_angle(mut self, angle: f32) -> Self {
+        self.angle = angle;
+        self
     }
 }
 
@@ -92,9 +125,14 @@ impl Gate for EllipseGate {
     fn contains(&self, event: ArrayView1<f32>) -> bool {
         let x = event[self.param_idx_x];
         let y = event[self.param_idx_y];
-        let dx = (x - self.center_x) / self.radius_x;
-        let dy = (y - self.center_y) / self.radius_y;
-        (dx * dx) + (dy * dy) <= 1.0
+        let dx = x - self.center_x;
+        let dy = y - self.center_y;
+        let (s, c) = self.angle.sin_cos();
+        let lx = dx * c + dy * s;
+        let ly = -dx * s + dy * c;
+        let ex = lx / self.radius_x;
+        let ey = ly / self.radius_y;
+        (ex * ex) + (ey * ey) <= 1.0
     }
     fn parameter_indices(&self) -> Vec<usize> {
         vec![self.param_idx_x, self.param_idx_y]
@@ -202,6 +240,100 @@ impl Gate for QuadrantGate {
             Quadrant::LowerLeft => xv <= self.x && yv <= self.y,
             Quadrant::LowerRight => xv >= self.x && yv <= self.y,
         }
+    }
+    fn parameter_indices(&self) -> Vec<usize> {
+        vec![self.param_idx_x, self.param_idx_y]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bilinear gate (two crossing lines split the plane into four wedges)
+// ---------------------------------------------------------------------------
+
+/// A bilinear gate: two straight lines crossing at a common center divide the
+/// plot into four wedge-shaped regions. A `BilinearGate` selects one of those
+/// regions, identified by which side of each line it lies on.
+///
+/// The signed distance of a point `p` from the line through the center with
+/// orientation `angle` is `d = (p.x - cx) * sin(angle) - (p.y - cy) * cos(angle)`.
+/// `side` is `true` when the point is on the positive side (`d >= 0`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BilinearGate {
+    pub param_idx_x: usize,
+    pub param_idx_y: usize,
+    /// Intersection point of the two dividing lines.
+    pub center_x: f32,
+    pub center_y: f32,
+    /// Orientation (radians) of the first dividing line.
+    pub angle1: f32,
+    /// Orientation (radians) of the second dividing line.
+    pub angle2: f32,
+    /// Half-length of each drawn line (a rendering aid; does not affect `contains`).
+    pub radius: f32,
+    /// Which side of line 1 to include (`true` => positive side).
+    pub side1: bool,
+    /// Which side of line 2 to include (`true` => positive side).
+    pub side2: bool,
+}
+
+impl BilinearGate {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        x: usize,
+        y: usize,
+        center_x: f32,
+        center_y: f32,
+        angle1: f32,
+        angle2: f32,
+        radius: f32,
+        side1: bool,
+        side2: bool,
+    ) -> Self {
+        Self {
+            param_idx_x: x,
+            param_idx_y: y,
+            center_x,
+            center_y,
+            angle1,
+            angle2,
+            radius,
+            side1,
+            side2,
+        }
+    }
+
+    /// Returns all four wedge regions as separate gates.
+    ///
+    /// Order: (+,+), (+,-), (-,+), (-,-) — i.e. side1/side2 combinations.
+    pub fn all(
+        x: usize,
+        y: usize,
+        center_x: f32,
+        center_y: f32,
+        angle1: f32,
+        angle2: f32,
+        radius: f32,
+    ) -> [Self; 4] {
+        [
+            Self::new(x, y, center_x, center_y, angle1, angle2, radius, true, true),
+            Self::new(x, y, center_x, center_y, angle1, angle2, radius, true, false),
+            Self::new(x, y, center_x, center_y, angle1, angle2, radius, false, true),
+            Self::new(x, y, center_x, center_y, angle1, angle2, radius, false, false),
+        ]
+    }
+
+    fn signed_side(x: f32, y: f32, cx: f32, cy: f32, angle: f32) -> f32 {
+        (x - cx) * angle.sin() - (y - cy) * angle.cos()
+    }
+}
+
+impl Gate for BilinearGate {
+    fn contains(&self, event: ArrayView1<f32>) -> bool {
+        let xv = event[self.param_idx_x];
+        let yv = event[self.param_idx_y];
+        let d1 = Self::signed_side(xv, yv, self.center_x, self.center_y, self.angle1);
+        let d2 = Self::signed_side(xv, yv, self.center_x, self.center_y, self.angle2);
+        (d1 >= 0.0) == self.side1 && (d2 >= 0.0) == self.side2
     }
     fn parameter_indices(&self) -> Vec<usize> {
         vec![self.param_idx_x, self.param_idx_y]
@@ -350,6 +482,29 @@ mod tests {
     }
 
     #[test]
+    fn rectangular_gate_rotation() {
+        use ndarray::array;
+        let flat = array![[0.2_f32, 0.2_f32], [5.0, 5.0]];
+        let axis = RectangularGate::new(0, 1, 0.0, 10.0, 0.0, 10.0);
+        assert!(axis.contains(flat.row(0)));
+        let rotated = RectangularGate::new(0, 1, 0.0, 10.0, 0.0, 10.0)
+            .with_angle(std::f32::consts::FRAC_PI_4);
+        assert!(!rotated.contains(flat.row(0)));
+        assert!(rotated.contains(flat.row(1)));
+    }
+
+    #[test]
+    fn ellipse_gate_rotation() {
+        use ndarray::array;
+        let p = array![[5.0_f32, 8.0_f32]];
+        let e0 = EllipseGate::new(0, 1, 5.0, 5.0, 4.0, 1.0);
+        assert!(!e0.contains(p.row(0)));
+        let e90 = EllipseGate::new(0, 1, 5.0, 5.0, 4.0, 1.0)
+            .with_angle(std::f32::consts::FRAC_PI_2);
+        assert!(e90.contains(p.row(0)));
+    }
+
+    #[test]
     fn ellipse_gate_filters() {
         let data = sample_data();
         let gate = EllipseGate::new(0, 1, 1.5, 1.5, 1.0, 1.0);
@@ -381,6 +536,29 @@ mod tests {
         assert_eq!(ur, vec![5]);
         assert_eq!(ll, vec![0, 1]);
         assert_eq!(lr, vec![2, 3]);
+    }
+
+    #[test]
+    fn bilinear_gate_filters_quadrants() {
+        let data = sample_data();
+        // Center at (5,5), lines at 45deg and 135deg (an "X").
+        let quads = BilinearGate::all(
+            0,
+            1,
+            5.0,
+            5.0,
+            std::f32::consts::FRAC_PI_4,
+            3.0 * std::f32::consts::FRAC_PI_4,
+            10.0,
+        );
+        // (+,+): events 0 [1,1], 1 [2,2], 4 [1,8]?  Verify via the dividing lines.
+        let all: Vec<Vec<usize>> = quads.iter().map(|g| g.filter(&data)).collect();
+        // Every event is captured by exactly one wedge.
+        let total: usize = all.iter().map(|v| v.len()).sum();
+        assert_eq!(total, data.nrows());
+        let mut union: Vec<usize> = all.iter().flatten().copied().collect();
+        union.sort_unstable();
+        assert_eq!(union, vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

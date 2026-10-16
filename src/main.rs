@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use flowers::{
     compensation::CompensationEngine,
     fcs::FcsParser,
-    gating::{EllipseGate, Gate, Quadrant, QuadrantGate, RectangularGate},
+    gating::{BilinearGate, EllipseGate, Gate, Quadrant, QuadrantGate, RectangularGate},
     plot::{dot_plot_svg, histogram_svg, PlotStyle},
     statistics::{compute_profile, print_profile},
 };
@@ -32,7 +32,7 @@ enum Commands {
         fcs: PathBuf,
         /// Name for the resulting population.
         population: String,
-        /// Gate type: rect, ellipse, quadrant.
+        /// Gate type: rect, ellipse, quadrant, bilinear.
         #[arg(value_enum)]
         gate: GateType,
         /// X parameter index.
@@ -101,6 +101,7 @@ enum GateType {
     Rect,
     Ellipse,
     Quadrant,
+    Bilinear,
 }
 
 fn main() {
@@ -156,6 +157,22 @@ fn run(command: Commands) -> Result<(), anyhow::Error> {
                 GateType::Quadrant => {
                     Box::new(QuadrantGate::new(x, y, min_x, min_y, Quadrant::UpperRight))
                 }
+                GateType::Bilinear => {
+                    let cx = (min_x + max_x) / 2.0;
+                    let cy = (min_y + max_y) / 2.0;
+                    let radius = ((max_x - min_x).abs().max((max_y - min_y).abs())) / 2.0;
+                    Box::new(BilinearGate::new(
+                        x,
+                        y,
+                        cx,
+                        cy,
+                        std::f32::consts::FRAC_PI_4,
+                        3.0 * std::f32::consts::FRAC_PI_4,
+                        radius,
+                        true,
+                        true,
+                    ))
+                }
             };
             let indices = gate.filter(&fcs_file.data);
             println!(
@@ -210,6 +227,7 @@ fn run(command: Commands) -> Result<(), anyhow::Error> {
                 &[],
                 None,
                 None,
+                &[],
                 &PlotStyle::default(),
             );
             fs::write(&out, &svg)?;
