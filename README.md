@@ -1,9 +1,9 @@
-# Flowers - A FlowJo Alternative in Rust
+# flowers - A FlowJo Alternative in Rust
 
 [![Rust](https://img.shields.io/badge/rust-1.99+-orange.svg)](https://rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`Flowers` is an open-source FlowJo alternative for flow cytometry analysis, written in Rust. It provides FCS file parsing, compensation, multi-gate gating (rectangular, elliptical, polygon, quadrant, bilinear, boolean), population statistics, SVG plotting, and a desktop GUI.
+`flowers` is an open-source FlowJo alternative for flow cytometry analysis, written in Rust. It provides FCS file parsing, compensation, multi-gate gating (rectangular, elliptical, polygon, quadrant, bilinear, boolean), population statistics, SVG plotting, and a desktop GUI.
 
 ## Features
 
@@ -38,10 +38,15 @@
 
 See `docs/USER_GUIDE.md` for a complete guide to using the GUI and all of its features.
 
+## Known Issues:
+
+- Bilinear Gate is does not work.
+- Layout Editor's "Add current plot" button only selects the plots shown on the main window
+
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/flowers.git
+git clone https://github.com/Seyoung-Research/flowers.git
 cd flowers
 cargo build --release
 ```
