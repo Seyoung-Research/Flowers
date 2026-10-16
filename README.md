@@ -24,8 +24,14 @@
 | **CSV reports** | Export per-population counts, percentages, and gate summaries |
 | **Layout editor** | Drag, resize, reorder and preview plots on a free-form canvas, then export |
 | **Figure export** | Export single plots or composed layouts as SVG, PNG, JPEG, or TIFF |
+| **Histogram view** | 1D histogram (counts view) of the X-axis channel |
+| **Per-gate apply control** | Toggle whether each gate applies to all samples or only its owner |
 | **Desktop GUI** | egui-based application: load files, gate populations, export plots |
 | **CLI** | Scriptable command-line interface for batch workflows |
+
+## Documentation
+
+See `docs/USER_GUIDE.md` for a complete guide to using the GUI and all of its features.
 
 ## Installation
 
@@ -50,26 +56,26 @@ cargo build --release
 cargo run --bin flowers-gui --release
 ```
 
-1. Click **Load FCS File** (or use the **Load FCS** menu).
+1. Click **Load FCS File** (or use **File ▸ Load FCS** from the top menu).
 2. Select **X** and **Y** parameters from the dropdowns (human-readable names like "FITC-H", "PE-A").
 3. **Drag on the scatter plot** to create a gate, or click **+ Add Gate**. Use the
-   **New gate type** selector to draw rectangles, ellipses, quadrants, or bilinear gates.
+   **New gate type** selector to draw rectangles, ellipses, polygons, quadrants, or bilinear gates.
 4. Open **Axis options** to set each axis to linear/log, edit the X/Y ranges, or hit
    **Auto** to fit the axis to the data.
 5. Open **Point & view options** to change the dot colour, enable **density gradient**
-   layering, or switch the view to a **contour** topographic plot.
+   layering (on by default), or switch the view to **Dots**, **Contour**, or **Histogram**.
 6. Gates appear in the **Gate tree** on the right, nested like FlowJo; select a gate to
    edit its geometry, name, colour, or parent. A selected gate shows **drag handles** on
-   the plot (corner handles enlarge/shrink, the diamond handle rotates, dragging the body
+   the plot (corner/edge handles enlarge or stretch, the diamond handle rotates, dragging the body
    moves it) plus **nudge / rotate / scale** buttons in the editor. Click **◧** to open a
    detached window showing only that population — it has its own axes, ranges, scales,
    colour, view and gating controls.
-7. Add panels in the **Layout editor** and open the editor window to drag, resize and
+7. Use **File ▸ Export SVG** / **File ▸ Export Image…** for a single plot, and **File ▸ Export CSV** for
+   population counts and percentages across every loaded sample. Switch between the
+   **Dark** and **Light** themes from **Settings ▸ Theme**.
+8. Add panels in the **Layout editor** (from the top menu) and drag, resize and
    reorder plots on a live canvas before exporting the composed figure as **SVG** or a
    raster image (**PNG / JPEG / TIFF**).
-8. Use **Export SVG** / **Export Image…** for a single plot, and **Export CSV** for
-   population counts and percentages across every loaded sample. Switch between the
-   **Dark** and **Light** themes from the menu bar.
 
 ### CLI
 

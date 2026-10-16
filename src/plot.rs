@@ -128,27 +128,41 @@ fn svg_escape(s: &str) -> String {
 }
 
 /// Formats an axis tick value for display given an axis scale.
-fn format_tick(v: f64, scale: AxisScale) -> String {
-    match scale {
-        AxisScale::Linear => {
-            if v.abs() >= 1000.0 {
-                format!("{v:.0}")
-            } else if v.abs() >= 10.0 {
-                format!("{v:.1}")
-            } else {
-                format!("{v:.2}")
-            }
+///
+/// Large values are rendered in scientific notation (e.g. `7e4` for 70000) so
+/// that tick labels do not collide with the axis title.
+pub fn format_tick(v: f64, scale: AxisScale) -> String {
+    let value = match scale {
+        AxisScale::Linear => v,
+        AxisScale::Log => 10f64.powf(v),
+    };
+    if !value.is_finite() {
+        return "".to_string();
+    }
+    let abs = value.abs();
+    if abs >= 1000.0 || (abs > 0.0 && abs < 0.01) {
+        // Scientific notation: one significant digit, strip trailing ".0".
+        let mut s = format!("{value:.1e}");
+        // "7.0e4" -> "7e4", "7.5e4" stays "7.5e4".
+        if let Some(pos) = s.find(".0e") {
+            s.replace_range(pos..pos + 2, "e");
         }
-        AxisScale::Log => {
-            let value = 10f64.powf(v);
-            if value >= 1000.0 {
-                format!("{value:.0}")
-            } else if value >= 10.0 {
-                format!("{value:.0}")
-            } else {
-                format!("{value:.2}")
-            }
+        // Normalise exponent: "7e+04" -> "7e4".
+        if let Some(e_pos) = s.find('e') {
+            let rest = &s[e_pos + 1..];
+            let normalized = rest.trim_start_matches('+').trim_start_matches('0');
+            let normalized = if normalized.is_empty() { "0" } else { normalized };
+            s = format!("{}e{}", &s[..=e_pos], normalized);
         }
+        s
+    } else if abs >= 100.0 {
+        format!("{value:.0}")
+    } else if abs >= 10.0 {
+        format!("{value:.1}")
+    } else if abs >= 1.0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.3}")
     }
 }
 
